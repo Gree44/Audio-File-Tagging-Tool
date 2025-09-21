@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "package": {
+    "productName": "Audio Tagger",
+    "version": "0.1.0"
+  },
+  "build": {
+    "beforeDevCommand": "vite",
+    "beforeBuildCommand": "vite build",
+    "devPath": "http://localhost:5173",
+    "distDir": "dist"
+  },
+  "tauri": {
+    "windows": [{ "title": "Audio Tagger", "width": 1200, "height": 800 }],
+    "bundle": {
+      "identifier": "com.janmuller.audio-tagger",
+      "icon": ["icons/icon.png"]
+    }
+  }
+}
