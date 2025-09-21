@@ -26,6 +26,15 @@ import {
 function useHotkeys(bindings: Record<string, (e: KeyboardEvent) => void>) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      const isTyping =
+        tag === "input" ||
+        tag === "textarea" ||
+        (target as HTMLElement | null)?.isContentEditable;
+
+      if (isTyping) return;
+
       const key = [e.shiftKey ? "Shift+" : "", e.key].join("");
       const simple = e.key;
       if (bindings[key]) {
@@ -156,6 +165,7 @@ function TagManager({
         onClick={(e) => e.stopPropagation()}
         tabIndex={0}
         onKeyDown={(e) => {
+          e.stopPropagation(); // prevent global hotkeys while typing in the modal
           if (e.key === "Enter") save();
           if (e.key === "Escape") onClose();
         }}
@@ -332,57 +342,101 @@ function SongTagging({
     showGenre: true,
   }));
   const [showManager, setShowManager] = useState(false);
-
+  const [loading, setLoading] = useState(true);
   const audioUrl = useMemo(() => (meta ? fileUrl(meta.path) : ""), [meta]);
 
   useEffect(() => {
+    let alive = true;
     (async () => {
-      const list = await scanFolder(folder);
-      list.sort((a, b) => a.fileName.localeCompare(b.fileName));
-      setFiles(list);
-      setCurrentIndex(0);
+      try {
+        setLoading(true);
+        const list = await scanFolder(folder);
+        if (!alive) return;
+        list.sort((a, b) => a.fileName.localeCompare(b.fileName));
+        setFiles(list);
+
+        if (list.length) {
+          // Load the first track directly from the freshly fetched list
+          await loadTrackForEntry(list[0]);
+          setCurrentIndex(0);
+        } else {
+          setMeta(null);
+        }
+      } catch (e) {
+        console.error("[scanFolder] failed:", e);
+        alert("Failed to scan folder: " + e);
+      } finally {
+        if (alive) setLoading(false);
+      }
     })();
+    return () => {
+      alive = false;
+    };
   }, [folder]);
 
-  useEffect(() => {
-    if (!files.length) return;
-    selectIndex(0);
-  }, [files]);
+  if (loading) {
+    return (
+      <div className="col" style={{ padding: 24 }}>
+        <div className="panel">Loading folder…</div>
+      </div>
+    );
+  }
+
+  if (!files.length) {
+    return (
+      <div className="col" style={{ padding: 24 }}>
+        <div className="row" style={{ marginBottom: 8 }}>
+          <button className="btn" onClick={onBack}>
+            ← Back
+          </button>
+        </div>
+        <div className="panel">
+          No supported audio files found in this folder.
+        </div>
+      </div>
+    );
+  }
+
+  async function loadTrackForEntry(entry: { path: string; fileName: string }) {
+    try {
+      const m: TrackMeta = await readMetadata(entry.path);
+      setMeta(m);
+      setPlaying(false);
+
+      // Normalize AFTER render (non-blocking), using a snapshot
+      const metaSnapshot = { path: entry.path, comment: m.comment || "" };
+      Promise.resolve().then(async () => {
+        const parsed = parseCommentToTags(metaSnapshot.comment, tagsFile.tags);
+        const enforced = enforceParentAndMandatory([...parsed], tagsFile.tags);
+        const commentNormalized = stringifyTagsForComment(enforced);
+        if (commentNormalized !== metaSnapshot.comment) {
+          try {
+            await writeComment(metaSnapshot.path, commentNormalized);
+            await logEvent(
+              `normalize_on_load path="${metaSnapshot.path}" -> "${commentNormalized}"`
+            );
+            setMeta((prev) =>
+              prev && prev.path === metaSnapshot.path
+                ? { ...prev, comment: commentNormalized }
+                : prev
+            );
+          } catch (e) {
+            console.error("Failed to normalize tags on load:", e);
+            alert("Failed to normalize tags on load: " + e);
+          }
+        }
+      });
+    } catch (e) {
+      console.error("[readMetadata] failed:", e);
+      alert("Failed to read metadata: " + e);
+    }
+  }
 
   async function selectIndex(ix: number) {
     if (!files.length) return;
     const bounded = (ix + files.length) % files.length;
     setCurrentIndex(bounded);
-    const f = files[bounded];
-
-    // 1) Load metadata and render UI immediately
-    const m: TrackMeta = await readMetadata(f.path);
-    setMeta(m);
-    setPlaying(false);
-
-    // 2) Normalize tags AFTER render (non-blocking)
-    Promise.resolve().then(async () => {
-      const parsed = parseCommentToTags(m.comment || "", tagsFile.tags);
-      const enforced = enforceParentAndMandatory([...parsed], tagsFile.tags);
-      const commentNormalized = stringifyTagsForComment(enforced);
-
-      if (commentNormalized !== (m.comment || "")) {
-        try {
-          await writeComment(f.path, commentNormalized);
-          await logEvent(
-            `normalize_on_load path="${f.path}" -> "${commentNormalized}"`
-          );
-          setMeta((prev) =>
-            prev && prev.path === f.path
-              ? { ...prev, comment: commentNormalized }
-              : prev
-          );
-        } catch (e: any) {
-          console.error("Failed to normalize tags on load:", e);
-          alert("Failed to normalize tags on load: " + e);
-        }
-      }
-    });
+    await loadTrackForEntry(files[bounded]);
   }
 
   function toggleSort() {
@@ -729,10 +783,15 @@ export default function App() {
   }, []);
 
   async function handleOpenFolder() {
-    const path = await chooseFolder();
-    if (path) {
+    try {
+      const path = await chooseFolder();
+      if (!path) return;
+      console.info("[handleOpenFolder] opening:", path);
       setFolder(path);
       setScreen("tag");
+    } catch (e) {
+      console.error("[handleOpenFolder] failed:", e);
+      alert("Failed to open folder: " + e);
     }
   }
 

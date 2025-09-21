@@ -1,4 +1,5 @@
 import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
+import { open } from "@tauri-apps/api/dialog";
 import type { TrackMeta } from "./types";
 
 export async function initSession(): Promise<void> {
@@ -31,7 +32,16 @@ export async function writeTagsFile(json: string): Promise<void> {
 }
 
 export async function chooseFolder(): Promise<string | null> {
-  return invoke<string | null>("choose_folder");
+  try {
+    const res = await open({ directory: true, multiple: false });
+    const path = typeof res === "string" ? res : null;
+    if (!path) console.info("[chooseFolder] user cancelled");
+    else console.info("[chooseFolder] selected:", path);
+    return path;
+  } catch (e) {
+    console.error("[chooseFolder] failed:", e);
+    return null;
+  }
 }
 
 export async function logEvent(message: string): Promise<void> {
