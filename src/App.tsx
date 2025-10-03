@@ -8,7 +8,7 @@ import {
   readTagsFile,
   writeTagsFile,
   logEvent,
-  fileUrl,
+  fileBlobUrl,
 } from "./tauri";
 import Waveform from "./components/Waveform";
 import { TagDef, TagsFile, TrackMeta, Settings } from "./types";
@@ -331,6 +331,7 @@ function SongTagging({
   tagsFile: TagsFile;
   setTagsFile: (t: TagsFile) => void;
 }) {
+  // ---- Stable hook order (these never change across renders) ----
   const [files, setFiles] = useState<{ path: string; fileName: string }[]>([]);
   const [sortAsc, setSortAsc] = useState(true);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -343,87 +344,67 @@ function SongTagging({
   }));
   const [showManager, setShowManager] = useState(false);
   const [loading, setLoading] = useState(true);
-  const audioUrl = useMemo(() => (meta ? fileUrl(meta.path) : ""), [meta]);
+  const [audioSrc, setAudioSrc] = useState<string>("");
+  const [volume, setVolume] = useState(0.3); // default 30%
 
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      try {
-        setLoading(true);
-        const list = await scanFolder(folder);
-        if (!alive) return;
-        list.sort((a, b) => a.fileName.localeCompare(b.fileName));
-        setFiles(list);
-
-        if (list.length) {
-          // Load the first track directly from the freshly fetched list
-          await loadTrackForEntry(list[0]);
-          setCurrentIndex(0);
-        } else {
-          setMeta(null);
-        }
-      } catch (e) {
-        console.error("[scanFolder] failed:", e);
-        alert("Failed to scan folder: " + e);
-      } finally {
-        if (alive) setLoading(false);
-      }
-    })();
     return () => {
-      alive = false;
+      setAudioSrc((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return "";
+      });
     };
-  }, [folder]);
+  }, []);
 
-  if (loading) {
-    return (
-      <div className="col" style={{ padding: 24 }}>
-        <div className="panel">Loading folder…</div>
-      </div>
-    );
-  }
-
-  if (!files.length) {
-    return (
-      <div className="col" style={{ padding: 24 }}>
-        <div className="row" style={{ marginBottom: 8 }}>
-          <button className="btn" onClick={onBack}>
-            ← Back
-          </button>
-        </div>
-        <div className="panel">
-          No supported audio files found in this folder.
-        </div>
-      </div>
-    );
-  }
-
+  // ---- Hoisted helpers (function declarations avoid TDZ) ----
   async function loadTrackForEntry(entry: { path: string; fileName: string }) {
     try {
+      console.time(`[readMetadata] ${entry.fileName}`);
       const m: TrackMeta = await readMetadata(entry.path);
+      console.timeEnd(`[readMetadata] ${entry.fileName}`);
       setMeta(m);
       setPlaying(false);
 
+      // Build a Blob URL for <audio> (works around asset:// CORS)
+      try {
+        const url = await fileBlobUrl(entry.path);
+        setAudioSrc((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return url;
+        });
+      } catch (e) {
+        console.error("[fileBlobUrl] failed", e);
+        setAudioSrc((prev) => {
+          if (prev) URL.revokeObjectURL(prev);
+          return "";
+        });
+      }
+
       // Normalize AFTER render (non-blocking), using a snapshot
-      const metaSnapshot = { path: entry.path, comment: m.comment || "" };
+      const snapshot = { path: entry.path, comment: m.comment || "" };
       Promise.resolve().then(async () => {
-        const parsed = parseCommentToTags(metaSnapshot.comment, tagsFile.tags);
-        const enforced = enforceParentAndMandatory([...parsed], tagsFile.tags);
-        const commentNormalized = stringifyTagsForComment(enforced);
-        if (commentNormalized !== metaSnapshot.comment) {
-          try {
-            await writeComment(metaSnapshot.path, commentNormalized);
+        try {
+          const parsed = parseCommentToTags(snapshot.comment, tagsFile.tags);
+          const enforced = enforceParentAndMandatory(
+            [...parsed],
+            tagsFile.tags
+          );
+          const normalized = stringifyTagsForComment(enforced);
+          if (normalized !== snapshot.comment) {
+            await writeComment(snapshot.path, normalized);
             await logEvent(
-              `normalize_on_load path="${metaSnapshot.path}" -> "${commentNormalized}"`
+              `normalize_on_load path="${snapshot.path}" -> "${normalized}"`
             );
             setMeta((prev) =>
-              prev && prev.path === metaSnapshot.path
-                ? { ...prev, comment: commentNormalized }
+              prev && prev.path === snapshot.path
+                ? { ...prev, comment: normalized }
                 : prev
             );
-          } catch (e) {
-            console.error("Failed to normalize tags on load:", e);
-            alert("Failed to normalize tags on load: " + e);
           }
+        } catch (e) {
+          console.error("[normalize] failed:", e);
+          // window.alert fallback; remove if noisy
+          alert("Failed to normalize tags on load: " + e);
         }
       });
     } catch (e) {
@@ -439,20 +420,39 @@ function SongTagging({
     await loadTrackForEntry(files[bounded]);
   }
 
-  function toggleSort() {
-    const next = !sortAsc;
-    setSortAsc(next);
-    const sorted = [...files].sort((a, b) =>
-      next
-        ? a.fileName.localeCompare(b.fileName)
-        : b.fileName.localeCompare(a.fileName)
-    );
-    const currentPath = files[currentIndex]?.path;
-    setFiles(sorted);
-    const newIx = sorted.findIndex((s) => s.path === currentPath);
-    if (newIx >= 0) setCurrentIndex(newIx);
-  }
+  // ---- Scan effect (runs once per folder) ----
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        console.time("[scanFolder]");
+        setLoading(true);
+        const list = await scanFolder(folder);
+        if (!alive) return;
+        console.log("[scanFolder] returned", list.length, "files");
 
+        list.sort((a, b) => a.fileName.localeCompare(b.fileName));
+        setFiles(list);
+        if (list.length) {
+          await loadTrackForEntry(list[0]);
+          setCurrentIndex(0);
+        } else {
+          setMeta(null);
+        }
+      } catch (e) {
+        console.error("[scanFolder] failed:", e);
+        alert("Failed to scan folder: " + e);
+      } finally {
+        if (alive) setLoading(false);
+        console.timeEnd("[scanFolder]");
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [folder]);
+
+  // ---- Global hotkeys (never conditional) ----
   useHotkeys({
     " ": () => setPlaying((p) => !p),
     ArrowLeft: () =>
@@ -482,6 +482,10 @@ function SongTagging({
     ] as [string, (e: KeyboardEvent) => void][])
   );
 
+  function tokenList() {
+    return parseCommentToTags(meta?.comment || "", tagsFile.tags);
+  }
+
   async function persistTags(chosen: { tag: TagDef; amount: number | null }[]) {
     if (!meta) return;
     const final = enforceParentAndMandatory(dedupeById(chosen), tagsFile.tags);
@@ -494,13 +498,9 @@ function SongTagging({
       await writeComment(meta.path, str);
       await logEvent(`write_comment path="${meta.path}" -> "${str}"`);
       setMeta({ ...meta, comment: str });
-    } catch (e: any) {
+    } catch (e) {
       alert("Write failed: " + e);
     }
-  }
-
-  function tokenList() {
-    return parseCommentToTags(meta?.comment || "", tagsFile.tags);
   }
 
   async function toggleTag(t: TagDef) {
@@ -524,6 +524,21 @@ function SongTagging({
     await persistTags(list);
   }
 
+  function toggleSort() {
+    const next = !sortAsc;
+    setSortAsc(next);
+    const sorted = [...files].sort((a, b) =>
+      next
+        ? a.fileName.localeCompare(b.fileName)
+        : b.fileName.localeCompare(a.fileName)
+    );
+    const currentPath = files[currentIndex]?.path;
+    setFiles(sorted);
+    const newIx = sorted.findIndex((s) => s.path === currentPath);
+    if (newIx >= 0) setCurrentIndex(newIx);
+  }
+
+  // ---- Render (single return; no early-return that could skip hooks) ----
   return (
     <div
       style={{
@@ -532,6 +547,7 @@ function SongTagging({
         height: "100%",
       }}
     >
+      {/* Sidebar */}
       <div className="sidebar">
         <div
           className="row"
@@ -544,17 +560,24 @@ function SongTagging({
             Sort {sortAsc ? "▲" : "▼"}
           </button>
         </div>
-        {files.map((f, i) => (
-          <div
-            key={f.path}
-            className={`sidebar-item ${i === currentIndex ? "active" : ""}`}
-            onClick={() => selectIndex(i)}
-          >
-            {f.fileName}
-          </div>
-        ))}
+        {loading ? (
+          <div className="panel">Loading…</div>
+        ) : files.length === 0 ? (
+          <div className="panel">No supported audio files found.</div>
+        ) : (
+          files.map((f, i) => (
+            <div
+              key={f.path}
+              className={`sidebar-item ${i === currentIndex ? "active" : ""}`}
+              onClick={() => selectIndex(i)}
+            >
+              {f.fileName}
+            </div>
+          ))
+        )}
       </div>
 
+      {/* Main */}
       <div className="col" style={{ padding: 12 }}>
         <div className="toolbar">
           <div className="row" style={{ gap: 8 }}>
@@ -573,6 +596,22 @@ function SongTagging({
             >
               Next <span className="kbd">D</span>
             </button>
+            <label
+              className="row"
+              style={{ gap: 6, alignItems: "center", marginLeft: 8 }}
+            >
+              <span style={{ fontSize: 12, color: "#555" }}>Vol</span>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={1}
+                value={Math.round(volume * 100)}
+                onChange={(e) => setVolume(Number(e.currentTarget.value) / 100)}
+                style={{ width: 140 }}
+              />
+              <span className="kbd">{Math.round(volume * 100)}%</span>
+            </label>
           </div>
           <div className="row" style={{ gap: 8 }}>
             <button className="btn" onClick={() => setShowManager(true)}>
@@ -585,7 +624,7 @@ function SongTagging({
         {meta && (
           <div className="row" style={{ alignItems: "flex-start" }}>
             <div className="panel" style={{ flex: 1 }}>
-              <Waveform url={audioUrl} playing={playing} />
+              <Waveform url={audioSrc} playing={playing} volume={volume} />
             </div>
             <div className="col" style={{ width: 180, gap: 8 }}>
               {meta.pictureDataUrl ? (
@@ -768,6 +807,38 @@ function SettingsButton({
   );
 }
 
+class AppErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error?: any }
+> {
+  constructor(props: any) {
+    super(props);
+    this.state = { error: undefined };
+  }
+  componentDidCatch(error: any, info: any) {
+    console.error("[ErrorBoundary] caught", error, info);
+    this.setState({ error });
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="col" style={{ padding: 24, gap: 12 }}>
+          <div className="panel">
+            <b>App error</b>
+            <pre style={{ whiteSpace: "pre-wrap" }}>
+              {String(this.state.error)}
+            </pre>
+          </div>
+          <button className="btn" onClick={() => location.reload()}>
+            Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children as any;
+  }
+}
+
 export default function App() {
   const [screen, setScreen] = useState<"start" | "tag">("start");
   const [folder, setFolder] = useState<string | null>(null);
@@ -796,7 +867,7 @@ export default function App() {
   }
 
   return (
-    <>
+    <AppErrorBoundary>
       {screen === "start" ? (
         <StartScreen
           onOpenFolder={handleOpenFolder}
@@ -821,6 +892,6 @@ export default function App() {
           onClose={() => setShowManager(false)}
         />
       )}
-    </>
+    </AppErrorBoundary>
   );
 }
