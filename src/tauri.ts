@@ -10,11 +10,29 @@ export async function initSession(): Promise<void> {
 export async function scanFolder(
   path: string
 ): Promise<{ path: string; fileName: string }[]> {
-  return invoke<{ path: string; fileName: string }[]>("scan_folder", { path });
+  const raw = await invoke<any>("scan_folder", { path });
+  const list = Array.isArray(raw) ? raw : [];
+  return list
+    .map((x: any) => ({
+      path: x.path,
+      fileName: x.fileName ?? x.file_name ?? "",
+    }))
+    .filter((x) => x.path && x.fileName);
 }
 
 export async function readMetadata(path: string): Promise<TrackMeta> {
-  return invoke<TrackMeta>("read_metadata", { path });
+  const m = await invoke<any>("read_metadata", { path });
+  // normalize snake_case from Rust v1 to our TS interface
+  return {
+    path: m.path,
+    fileName: m.fileName ?? m.file_name ?? "",
+    title: m.title ?? undefined,
+    artists: m.artists ?? [],
+    genre: m.genre ?? undefined,
+    comment: m.comment ?? "",
+    pictureDataUrl: m.pictureDataUrl ?? m.picture_data_url ?? null,
+    format: m.format ?? undefined,
+  };
 }
 
 export async function writeComment(

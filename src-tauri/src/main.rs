@@ -14,9 +14,11 @@ static LOG_PATH: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
 static WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SimpleFile { path: String, file_name: String }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TrackMeta {
   path: String,
   file_name: String,
