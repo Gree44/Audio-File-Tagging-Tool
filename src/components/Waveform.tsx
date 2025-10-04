@@ -8,6 +8,8 @@ interface Props {
   onTime?: (t: number) => void;
   playing: boolean;
   volume: number;
+  onAudioLoading?: (loading: boolean) => void;
+  onWaveLoading?: (loading: boolean) => void;
 }
 
 export default function Waveform({
@@ -16,6 +18,8 @@ export default function Waveform({
   onTime,
   playing,
   volume,
+  onAudioLoading,
+  onWaveLoading,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -31,70 +35,122 @@ export default function Waveform({
     }
   }, [volume]);
 
-  // (Re)create wavesurfer when URL changes; use a real <audio> element
   useEffect(() => {
-    if (!containerRef.current || !url) return;
+    // reset visuals immediately to avoid showing the old track
+    setDuration(0);
+    setTime(0);
+    setCursorLeft(0);
 
-    // ensure audio element exists & points to our URL
+    const container = containerRef.current;
+    if (!container || !url) {
+      onAudioLoading?.(false);
+      onWaveLoading?.(false);
+      // destroy any previous
+      wsRef.current?.destroy();
+      wsRef.current = null;
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.removeAttribute("src");
+        audioRef.current.load();
+      }
+      return;
+    }
+
+    onAudioLoading?.(true);
+    onWaveLoading?.(true);
+
+    // ensure a single reusable <audio>
     if (!audioRef.current) {
       audioRef.current = new Audio();
       audioRef.current.preload = "auto";
       audioRef.current.crossOrigin = "anonymous";
       audioRef.current.style.display = "none";
-      // optional: append so WebKit keeps it alive
-      containerRef.current.appendChild(audioRef.current);
+      container.appendChild(audioRef.current);
     }
-    audioRef.current.src = url;
-    console.info("Volume set to", audioRef.current.volume);
-    audioRef.current.volume = Math.max(0, Math.min(1, volume));
 
-    try {
-      const ws = WaveSurfer.create({
-        container: containerRef.current,
-        // visual config
-        waveColor: "#dcdcdc",
-        progressColor: "#a3a3a3",
-        cursorWidth: 0,
-        height: 120,
-        barWidth: 2,
-        barGap: 1,
-        // key bit: provide the media element so no fetch/XHR occurs
-        media: audioRef.current,
-      });
-      wsRef.current = ws;
+    const audio = audioRef.current;
+    audio.volume = Math.max(0, Math.min(1, volume));
+    audio.pause();
+    audio.removeAttribute("src"); // in case something is still loading
+    audio.load();
 
-      ws.on("ready", () => {
-        const dur = ws.getDuration();
-        setDuration(dur);
-        onReady?.(dur);
-      });
-      ws.on("timeupdate", (t) => {
-        setTime(t);
-        onTime?.(t);
-        if (containerRef.current) {
-          const w = containerRef.current.clientWidth;
+    const onLoadedMetadata = () => {
+      try {
+        // (re)create wavesurfer bound to the media element
+        wsRef.current?.destroy();
+        const ws = WaveSurfer.create({
+          container,
+          waveColor: "#dcdcdc",
+          progressColor: "#a3a3a3",
+          cursorWidth: 0,
+          height: 120,
+          barWidth: 2,
+          barGap: 1,
+          media: audio,
+        });
+        wsRef.current = ws;
+
+        ws.on("ready", () => {
+          const dur = ws.getDuration();
+          setDuration(dur);
+          onReady?.(dur);
+          onWaveLoading?.(false);
+        });
+        ws.on("timeupdate", (t) => {
+          setTime(t);
+          onTime?.(t);
+          const w = container.clientWidth;
           const pos = ws.getDuration()
             ? ws.getCurrentTime() / ws.getDuration()
             : 0;
           setCursorLeft(w * pos);
-        }
-      });
-      ws.on("error", (e: any) => {
-        console.error("[WaveSurfer] error", e);
-      });
+        });
+        ws.on("error", (e: any) => {
+          console.error("[WaveSurfer] error", e);
+          onWaveLoading?.(false);
+        });
+      } catch (e) {
+        console.error("[WaveSurfer] create failed", e);
+        onWaveLoading?.(false);
+      }
+    };
 
-      // trigger load by telling the audio element to load
-      audioRef.current!.load();
-    } catch (e) {
-      console.error("[WaveSurfer] create failed", e);
+    const onCanPlay = () => onAudioLoading?.(false);
+    const onError = (e: any) => {
+      console.error("[audio] error", e);
+      onAudioLoading?.(false);
+      onWaveLoading?.(false);
+    };
+
+    audio.addEventListener("loadedmetadata", onLoadedMetadata);
+    audio.addEventListener("canplay", onCanPlay);
+    audio.addEventListener("error", onError);
+
+    // finally set the new source and kick loading
+    console.debug("[Waveform] setting audio.src =", url);
+    if (!url || typeof url !== "string") {
+      onAudioLoading?.(false);
+      onWaveLoading?.(false);
+      return;
     }
+    audio.src = url;
+    audio.load();
 
     return () => {
+      audio.removeEventListener("loadedmetadata", onLoadedMetadata);
+      audio.removeEventListener("canplay", onCanPlay);
+      audio.removeEventListener("error", onError);
+
       wsRef.current?.destroy();
       wsRef.current = null;
-      // keep the audio element for reuse across urls; comment-out next two lines if you prefer to fully tear down
-      // audioRef.current?.remove()
-      // audioRef.current = null
+
+      // hard stop & clear src to kill any pending decode
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+
+      onAudioLoading?.(false);
+      onWaveLoading?.(false);
     };
   }, [url]);
 

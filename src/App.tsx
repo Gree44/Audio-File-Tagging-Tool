@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useRef } from "react";
+import React, { useEffect, useState, useRef } from "react";
 import {
   initSession,
   chooseFolder,
@@ -8,7 +8,7 @@ import {
   readTagsFile,
   writeTagsFile,
   logEvent,
-  fileBlobUrl,
+  fileUrl,
 } from "./tauri";
 import Waveform from "./components/Waveform";
 import { TagDef, TagsFile, TrackMeta, Settings } from "./types";
@@ -344,41 +344,32 @@ function SongTagging({
   }));
   const [showManager, setShowManager] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [audioSrc, setAudioSrc] = useState<string>("");
   const [volume, setVolume] = useState(0.3); // default 30%
-
-  useEffect(() => {
-    return () => {
-      setAudioSrc((prev) => {
-        if (prev) URL.revokeObjectURL(prev);
-        return "";
-      });
-    };
-  }, []);
+  const [audioUrl, setAudioUrl] = useState<string>("");
+  const [audioLoading, setAudioLoading] = useState(false);
+  const [waveLoading, setWaveLoading] = useState(false);
+  const [mediaUrl, setMediaUrl] = useState<string>(""); // URL we pass to <Waveform>
 
   // ---- Hoisted helpers (function declarations avoid TDZ) ----
   async function loadTrackForEntry(entry: { path: string; fileName: string }) {
     try {
+      // clear old media immediately
+      setPlaying(false);
+      setAudioUrl(""); // unmounts Waveform (destroys audio + ws)
+      setAudioLoading(true);
+      setWaveLoading(true);
+
+      // point the player at the new file right away (fast, no Blob read)
+      const newUrl = fileUrl(entry.path);
+      console.debug("[loadTrackForEntry] asset URL =", newUrl);
+
+      setAudioUrl(newUrl);
+
+      // fetch metadata in parallel
       console.time(`[readMetadata] ${entry.fileName}`);
       const m: TrackMeta = await readMetadata(entry.path);
       console.timeEnd(`[readMetadata] ${entry.fileName}`);
       setMeta(m);
-      setPlaying(false);
-
-      // Build a Blob URL for <audio> (works around asset:// CORS)
-      try {
-        const url = await fileBlobUrl(entry.path);
-        setAudioSrc((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          return url;
-        });
-      } catch (e) {
-        console.error("[fileBlobUrl] failed", e);
-        setAudioSrc((prev) => {
-          if (prev) URL.revokeObjectURL(prev);
-          return "";
-        });
-      }
 
       // Normalize AFTER render (non-blocking), using a snapshot
       const snapshot = { path: entry.path, comment: m.comment || "" };
@@ -403,7 +394,6 @@ function SongTagging({
           }
         } catch (e) {
           console.error("[normalize] failed:", e);
-          // window.alert fallback; remove if noisy
           alert("Failed to normalize tags on load: " + e);
         }
       });
@@ -624,8 +614,25 @@ function SongTagging({
         {meta && (
           <div className="row" style={{ alignItems: "flex-start" }}>
             <div className="panel" style={{ flex: 1 }}>
-              <Waveform url={audioSrc} playing={playing} volume={volume} />
+              <Waveform
+                url={mediaUrl}
+                playing={playing}
+                volume={volume}
+                onAudioLoading={setAudioLoading}
+                onWaveLoading={setWaveLoading}
+              />
+              {audioLoading && (
+                <div style={{ marginTop: 6, color: "#666" }}>
+                  Audio is loading…
+                </div>
+              )}
+              {waveLoading && (
+                <div style={{ marginTop: 2, color: "#888" }}>
+                  Waveform is loading…
+                </div>
+              )}
             </div>
+
             <div className="col" style={{ width: 180, gap: 8 }}>
               {meta.pictureDataUrl ? (
                 <img className="img" src={meta.pictureDataUrl} alt="cover" />
