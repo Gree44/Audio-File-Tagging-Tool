@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import { fmtTime } from "../lib/format";
+import { fileBlobUrl } from "../tauri";
 
 interface Props {
   url: string;
@@ -24,6 +25,8 @@ export default function Waveform({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
+  const triedBlobRef = useRef(false); // avoid infinite fallback loops
+  const blobUrlRef = useRef<string | null>(null); // revoke on cleanup/switch
 
   const [duration, setDuration] = useState(0);
   const [time, setTime] = useState(0);
@@ -36,16 +39,20 @@ export default function Waveform({
   }, [volume]);
 
   useEffect(() => {
-    // reset visuals immediately to avoid showing the old track
+    // reset visuals immediately so old track doesn't linger
     setDuration(0);
     setTime(0);
     setCursorLeft(0);
 
     const container = containerRef.current;
+    // reset fallback state and revoke any previous blob
+    triedBlobRef.current = false;
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+
     if (!container || !url) {
-      onAudioLoading?.(false);
-      onWaveLoading?.(false);
-      // destroy any previous
       wsRef.current?.destroy();
       wsRef.current = null;
       if (audioRef.current) {
@@ -59,24 +66,23 @@ export default function Waveform({
     onAudioLoading?.(true);
     onWaveLoading?.(true);
 
-    // ensure a single reusable <audio>
+    // persistent hidden <audio> attached to <body>
     if (!audioRef.current) {
-      audioRef.current = new Audio();
-      audioRef.current.preload = "auto";
-      audioRef.current.crossOrigin = "anonymous";
-      audioRef.current.style.display = "none";
-      container.appendChild(audioRef.current);
+      const el = document.createElement("audio");
+      el.preload = "metadata"; // fast metadata first
+      el.style.display = "none";
+      document.body.appendChild(el);
+      audioRef.current = el;
     }
 
     const audio = audioRef.current;
     audio.volume = Math.max(0, Math.min(1, volume));
     audio.pause();
-    audio.removeAttribute("src"); // in case something is still loading
+    audio.removeAttribute("src");
     audio.load();
 
     const onLoadedMetadata = () => {
       try {
-        // (re)create wavesurfer bound to the media element
         wsRef.current?.destroy();
         const ws = WaveSurfer.create({
           container,
@@ -86,7 +92,7 @@ export default function Waveform({
           height: 120,
           barWidth: 2,
           barGap: 1,
-          media: audio,
+          media: audio, // bind to the element; no fetch
         });
         wsRef.current = ws;
 
@@ -115,24 +121,61 @@ export default function Waveform({
       }
     };
 
+    const pathFromUrl = (u: string): string | null => {
+      if (!u) return null;
+      // asset://localhost/%2FUsers%2F... -> /Users/...
+      const prefix = "asset://localhost/";
+      if (u.startsWith(prefix)) {
+        try {
+          return decodeURIComponent(u.slice(prefix.length));
+        } catch {}
+      }
+      // already a raw absolute path
+      if (u.startsWith("/")) return u;
+      // last resort: decode; if it looks like an absolute path, take it
+      try {
+        const dec = decodeURIComponent(u);
+        if (dec.startsWith("/")) return dec;
+      } catch {}
+      return null;
+    };
+
     const onCanPlay = () => onAudioLoading?.(false);
-    const onError = (e: any) => {
+
+    const onError = async (e: any) => {
       console.error("[audio] error", e);
+      // Fallback: build a Blob URL from disk and try again (once)
+      if (!triedBlobRef.current) {
+        const p = pathFromUrl(url);
+        if (p) {
+          triedBlobRef.current = true;
+          try {
+            console.warn(
+              "[audio] asset:// failed; falling back to Blob for",
+              p
+            );
+            onAudioLoading?.(true);
+            const obj = await fileBlobUrl(p);
+            if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+            blobUrlRef.current = obj;
+            audio.src = obj;
+            audio.load();
+            return;
+          } catch (err) {
+            console.error("[audio] blob fallback failed", err);
+          }
+        }
+      }
       onAudioLoading?.(false);
       onWaveLoading?.(false);
     };
 
-    audio.addEventListener("loadedmetadata", onLoadedMetadata);
-    audio.addEventListener("canplay", onCanPlay);
+    audio.addEventListener("loadedmetadata", onLoadedMetadata, { once: true });
+    audio.addEventListener("canplay", onCanPlay, { once: true });
+    // IMPORTANT: do NOT make error listener "once", so it can catch both asset and blob attempts
     audio.addEventListener("error", onError);
 
-    // finally set the new source and kick loading
     console.debug("[Waveform] setting audio.src =", url);
-    if (!url || typeof url !== "string") {
-      onAudioLoading?.(false);
-      onWaveLoading?.(false);
-      return;
-    }
     audio.src = url;
     audio.load();
 
@@ -144,13 +187,14 @@ export default function Waveform({
       wsRef.current?.destroy();
       wsRef.current = null;
 
-      // hard stop & clear src to kill any pending decode
       audio.pause();
       audio.removeAttribute("src");
       audio.load();
 
-      onAudioLoading?.(false);
-      onWaveLoading?.(false);
+      if (blobUrlRef.current) {
+        URL.revokeObjectURL(blobUrlRef.current);
+        blobUrlRef.current = null;
+      }
     };
   }, [url]);
 

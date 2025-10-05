@@ -345,7 +345,6 @@ function SongTagging({
   const [showManager, setShowManager] = useState(false);
   const [loading, setLoading] = useState(true);
   const [volume, setVolume] = useState(0.3); // default 30%
-  const [audioUrl, setAudioUrl] = useState<string>("");
   const [audioLoading, setAudioLoading] = useState(false);
   const [waveLoading, setWaveLoading] = useState(false);
   const [mediaUrl, setMediaUrl] = useState<string>(""); // URL we pass to <Waveform>
@@ -355,7 +354,7 @@ function SongTagging({
     try {
       // clear old media immediately
       setPlaying(false);
-      setAudioUrl(""); // unmounts Waveform (destroys audio + ws)
+      setMediaUrl(""); // unmounts Waveform (destroys audio + ws)
       setAudioLoading(true);
       setWaveLoading(true);
 
@@ -363,7 +362,7 @@ function SongTagging({
       const newUrl = fileUrl(entry.path);
       console.debug("[loadTrackForEntry] asset URL =", newUrl);
 
-      setAudioUrl(newUrl);
+      setMediaUrl(newUrl);
 
       // fetch metadata in parallel
       console.time(`[readMetadata] ${entry.fileName}`);

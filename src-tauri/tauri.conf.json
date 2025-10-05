@@ -16,6 +16,9 @@
       "fs": { "all": true },
       "path": { "all": true }
     },
+    "security": {
+      "csp": null
+    },
     "windows": [{ "title": "Audio Tagger", "width": 1200, "height": 800 }],
     "bundle": {
       "identifier": "com.janmuller.audio-tagger",

@@ -67,8 +67,17 @@ export async function logEvent(message: string): Promise<void> {
   await invoke<void>("log_event", { message });
 }
 
-export function fileUrl(path: string) {
-  return convertFileSrc(path);
+export function fileUrl(path: string): string {
+  try {
+    const u = convertFileSrc(path);
+    if (typeof u === "string" && u.startsWith("asset://")) return u;
+  } catch {
+    // fall through to manual build
+  }
+  // Manual fallback: encode the ABSOLUTE path as one segment
+  // Example: asset://localhost/%2FUsers%2Fjanmuller%2F...
+  const encoded = encodeURIComponent(path);
+  return `asset://localhost/${encoded}`;
 }
 
 function mimeFor(path: string): string {
