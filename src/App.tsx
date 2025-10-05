@@ -8,7 +8,7 @@ import {
   readTagsFile,
   writeTagsFile,
   logEvent,
-  fileUrl,
+  getMediaUrl,
 } from "./tauri";
 import Waveform from "./components/Waveform";
 import { TagDef, TagsFile, TrackMeta, Settings } from "./types";
@@ -358,9 +358,10 @@ function SongTagging({
       setAudioLoading(true);
       setWaveLoading(true);
 
-      // point the player at the new file right away (fast, no Blob read)
-      const newUrl = fileUrl(entry.path);
-      console.debug("[loadTrackForEntry] asset URL =", newUrl);
+      // NEW: get a fast streaming URL from Rust (HTTP with Range)
+      const newUrl = await getMediaUrl(entry.path);
+      console.debug("[loadTrackForEntry] http URL =", newUrl);
+      setMediaUrl(newUrl);
 
       setMediaUrl(newUrl);
 

@@ -123,16 +123,20 @@ export default function Waveform({
 
     const pathFromUrl = (u: string): string | null => {
       if (!u) return null;
-      // asset://localhost/%2FUsers%2F... -> /Users/...
       const prefix = "asset://localhost/";
       if (u.startsWith(prefix)) {
         try {
           return decodeURIComponent(u.slice(prefix.length));
         } catch {}
       }
-      // already a raw absolute path
+      if (u.startsWith("http://") || u.startsWith("https://")) {
+        try {
+          const url = new URL(u);
+          const p = url.searchParams.get("path");
+          if (p) return decodeURIComponent(p);
+        } catch {}
+      }
       if (u.startsWith("/")) return u;
-      // last resort: decode; if it looks like an absolute path, take it
       try {
         const dec = decodeURIComponent(u);
         if (dec.startsWith("/")) return dec;

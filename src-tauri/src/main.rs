@@ -9,6 +9,19 @@ use parking_lot::Mutex;
 use chrono::Local;
 use base64::{engine::general_purpose, Engine as _};
 
+use std::{convert::Infallible, io::{self, SeekFrom}, path::Path};
+
+use hyper::{Body, Request, Response, Server, StatusCode, header};
+use hyper::service::{make_service_fn, service_fn};
+use tokio::{fs::File, io::{AsyncSeekExt, AsyncReadExt}};
+use tokio_util::io::ReaderStream;
+use mime_guess::from_path;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use tauri::Manager;
+
+
+
+
 
 static LOG_PATH: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
 static WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -29,6 +42,11 @@ struct TrackMeta {
   picture_data_url: Option<String>,
   format: Option<String>,
 }
+
+struct AppState {
+  media_base: String, // e.g. "http://127.0.0.1:12123"
+}
+
 
 fn data_dir() -> PathBuf { app_data_dir(&tauri::Config::default()).unwrap_or(std::env::current_dir().unwrap()) }
 fn tags_file_path() -> PathBuf { let mut p = data_dir(); p.push("tags.json"); p }
@@ -142,11 +160,140 @@ fn write_tags_file(json: String) -> Result<(), String> {
   Ok(())
 }
 
+async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+  let not_found = || {
+    Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+  };
+
+  let uri = req.uri();
+  if uri.path() != "/audio" {
+    return Ok(not_found());
+  }
+
+  // Extract and decode ?path=...
+  let path = uri
+    .query()
+    .and_then(|q| q.split('&').find(|p| p.starts_with("path=")))
+    .and_then(|kv| kv.split_once('=').map(|(_, v)| v.to_string()))
+    .and_then(|enc| {
+      percent_encoding::percent_decode_str(&enc).decode_utf8().ok().map(|s| s.into_owned())
+    });
+
+  let path = match path {
+    Some(p) => p,
+    None => return Ok(not_found()),
+  };
+
+  if !Path::new(&path).exists() {
+    return Ok(not_found());
+  }
+
+  let mut file = match File::open(&path).await {
+    Ok(f) => f,
+    Err(_) => return Ok(not_found()),
+  };
+  let meta = match tokio::fs::metadata(&path).await {
+    Ok(m) => m,
+    Err(_) => return Ok(not_found()),
+  };
+  let file_len = meta.len();
+  let mime = from_path(&path).first_or_octet_stream();
+
+  let mut status = StatusCode::OK;
+  let mut start: u64 = 0;
+  let mut end: u64 = file_len.saturating_sub(1);
+
+  if let Some(range) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(r) = range.strip_prefix("bytes=") {
+      let mut parts = r.split('-');
+      if let Some(s) = parts.next().and_then(|s| s.parse::<u64>().ok()) {
+        start = s.min(end);
+      }
+      if let Some(e) = parts.next().and_then(|e| if e.is_empty() { None } else { e.parse::<u64>().ok() }) {
+        end = e.min(end);
+      }
+      if start <= end {
+        status = StatusCode::PARTIAL_CONTENT;
+      } else {
+        return Ok(Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE).body(Body::empty()).unwrap());
+      }
+    }
+  }
+
+  // Seek and stream only the requested range
+  if let Err(_) = file.seek(SeekFrom::Start(start)).await {
+    return Ok(not_found());
+  }
+  let to_read = end - start + 1;
+  let reader = file.take(to_read);                 // requires AsyncReadExt in scope
+  let stream = ReaderStream::new(reader);
+  let body = Body::wrap_stream(stream);            // requires hyper feature "stream"
+
+  let mut resp = Response::new(body);
+  *resp.status_mut() = status;
+  let headers = resp.headers_mut();
+  headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_str(mime.as_ref()).unwrap());
+  headers.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+  if status == StatusCode::PARTIAL_CONTENT {
+    let cr = format!("bytes {}-{}/{}", start, end, file_len);
+    headers.insert(header::CONTENT_RANGE, header::HeaderValue::from_str(&cr).unwrap());
+  }
+  Ok(resp)
+}
+
+
+async fn start_media_server() -> io::Result<u16> {
+  let std_listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+  let port = std_listener.local_addr()?.port();
+  std_listener.set_nonblocking(true)?;
+
+  let make = make_service_fn(|_conn| async {
+    Ok::<_, Infallible>(service_fn(media_response))
+  });
+
+  let server = Server::from_tcp(std_listener)
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    .serve(make);
+
+  tauri::async_runtime::spawn(async move {
+    if let Err(e) = server.await {
+      eprintln!("media server error: {}", e);
+    }
+  });
+
+  Ok(port)
+}
+
+
+#[tauri::command]
+fn media_url_for_path(path: String, state: tauri::State<AppState>) -> String {
+  let enc = utf8_percent_encode(&path, NON_ALPHANUMERIC).to_string();
+  format!("{}/audio?path={}", state.media_base, enc)
+}
+
+
+
 pub fn main() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
-      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, read_tags_file, write_tags_file
+      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, read_tags_file, write_tags_file, media_url_for_path
     ])
+    .setup(|app| {
+    tauri::async_runtime::block_on(async {
+      match start_media_server().await {
+        Ok(port) => {
+          let base = format!("http://127.0.0.1:{}", port);
+          app.manage(AppState { media_base: base });
+        }
+        Err(e) => {
+          eprintln!("Failed to start media server: {}", e);
+          app.manage(AppState { media_base: "http://127.0.0.1:0".into() });
+        }
+      }
+    });
+    Ok(())
+  })
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+    
 }

@@ -63,6 +63,10 @@ export async function chooseFolder(): Promise<string | null> {
   }
 }
 
+export async function getMediaUrl(path: string): Promise<string> {
+  return invoke<string>("media_url_for_path", { path });
+}
+
 export async function logEvent(message: string): Promise<void> {
   await invoke<void>("log_event", { message });
 }
