@@ -22,6 +22,7 @@ import {
   ensureAtLeastOneMain,
   dedupeById,
 } from "./lib/tags";
+import { StatusViewport, pushStatus } from "./ui/Status";
 
 function useHotkeys(bindings: Record<string, (e: KeyboardEvent) => void>) {
   useEffect(() => {
@@ -53,9 +54,11 @@ function useHotkeys(bindings: Record<string, (e: KeyboardEvent) => void>) {
 function StartScreen({
   onOpenFolder,
   onManageTags,
+  onOpenSettings,
 }: {
   onOpenFolder: () => void;
   onManageTags: () => void;
+  onOpenSettings: () => void;
 }) {
   useHotkeys({ o: () => onOpenFolder(), "+": () => onManageTags() });
   return (
@@ -65,6 +68,9 @@ function StartScreen({
         <div className="row" style={{ gap: 8 }}>
           <button className="btn" onClick={onManageTags}>
             Manage Tags <span className="kbd">+</span>
+          </button>
+          <button className="btn" onClick={onOpenSettings}>
+            Settings ⚙️
           </button>
           <button className="btn primary" onClick={onOpenFolder}>
             Open Folder <span className="kbd">o</span>
@@ -325,11 +331,15 @@ function SongTagging({
   onBack,
   tagsFile,
   setTagsFile,
+  settings,
+  onOpenSettings,
 }: {
   folder: string;
   onBack: () => void;
   tagsFile: TagsFile;
   setTagsFile: (t: TagsFile) => void;
+  settings: Settings;
+  onOpenSettings: () => void;
 }) {
   // ---- Stable hook order (these never change across renders) ----
   const [files, setFiles] = useState<{ path: string; fileName: string }[]>([]);
@@ -337,17 +347,13 @@ function SongTagging({
   const [currentIndex, setCurrentIndex] = useState(0);
   const [meta, setMeta] = useState<TrackMeta | null>(null);
   const [playing, setPlaying] = useState(false);
-  const [settings, setSettings] = useState<Settings>(() => ({
-    showTitle: true,
-    showAuthors: true,
-    showGenre: true,
-  }));
   const [showManager, setShowManager] = useState(false);
   const [loading, setLoading] = useState(true);
   const [volume, setVolume] = useState(0.3); // default 30%
   const [audioLoading, setAudioLoading] = useState(false);
   const [waveLoading, setWaveLoading] = useState(false);
   const [mediaUrl, setMediaUrl] = useState<string>(""); // URL we pass to <Waveform>
+  const isInitialLoadRef = useRef(true);
 
   // ---- Hoisted helpers (function declarations avoid TDZ) ----
   async function loadTrackForEntry(entry: { path: string; fileName: string }) {
@@ -408,6 +414,9 @@ function SongTagging({
     const bounded = (ix + files.length) % files.length;
     setCurrentIndex(bounded);
     await loadTrackForEntry(files[bounded]);
+    if (settings.instantPlayback && !isInitialLoadRef.current) {
+      setPlaying(true);
+    }
   }
 
   // ---- Scan effect (runs once per folder) ----
@@ -426,6 +435,7 @@ function SongTagging({
         if (list.length) {
           await loadTrackForEntry(list[0]);
           setCurrentIndex(0);
+          isInitialLoadRef.current = false;
         } else {
           setMeta(null);
         }
@@ -607,7 +617,9 @@ function SongTagging({
             <button className="btn" onClick={() => setShowManager(true)}>
               Manage Tags <span className="kbd">+</span>
             </button>
-            <SettingsButton settings={settings} setSettings={setSettings} />
+            <button className="btn" onClick={onOpenSettings}>
+              Settings ⚙️
+            </button>
           </div>
         </div>
 
@@ -758,58 +770,150 @@ function SongTagging({
   );
 }
 
-function SettingsButton({
+function GlobalSettingsModal({
   settings,
   setSettings,
+  onClose,
 }: {
   settings: Settings;
   setSettings: (s: Settings) => void;
+  onClose: () => void;
 }) {
-  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        (e as any).stopImmediatePropagation?.();
+        onClose();
+      }
+    };
+    const opts = { capture: true } as AddEventListenerOptions;
+    window.addEventListener("keydown", onKey, opts);
+    return () => window.removeEventListener("keydown", onKey, opts);
+  }, [onClose]);
+
+  const shortcuts: { label: string; keys: string }[] = [
+    { label: "Open folder", keys: "o" },
+    { label: "Play/Pause", keys: "Space" },
+    { label: "Previous song", keys: "a" },
+    { label: "Next song", keys: "d" },
+    { label: "Seek -10s / -30s", keys: "← / Shift+←" },
+    { label: "Seek +10s / +30s", keys: "→ / Shift+→" },
+    { label: "Toggle instant playback", keys: "⌘⇧P" },
+    { label: "Open/Close Settings", keys: "⌘," },
+    { label: "Manage tags", keys: "+" },
+    { label: "Save in tag editor", keys: "Enter" },
+    { label: "Apply tags 1–10", keys: "1..0" },
+    { label: "Apply tags 11–20", keys: "Shift+1..9" },
+  ];
+
   return (
-    <div style={{ position: "relative" }}>
-      <button className="btn" onClick={() => setOpen((o) => !o)}>
-        Settings ⚙️
-      </button>
-      {open && (
-        <div
-          className="panel"
-          style={{ position: "absolute", right: 0, top: "110%", zIndex: 50 }}
-        >
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showTitle}
-              onChange={(e) =>
-                setSettings({ ...settings, showTitle: e.target.checked })
-              }
-            />{" "}
-            Show title
-          </label>
-          <br />
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showAuthors}
-              onChange={(e) =>
-                setSettings({ ...settings, showAuthors: e.target.checked })
-              }
-            />{" "}
-            Show authors
-          </label>
-          <br />
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showGenre}
-              onChange={(e) =>
-                setSettings({ ...settings, showGenre: e.target.checked })
-              }
-            />{" "}
-            Show genre
-          </label>
+    <div className="modal-backdrop" onClick={onClose}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "80vw",
+          height: "80vh",
+          maxWidth: 1100,
+          display: "grid",
+          gridTemplateColumns: "2fr 1fr",
+          gap: 16,
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onClose();
+          }
+        }}
+      >
+        <div className="col" style={{ gap: 12, overflow: "auto" }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <h3>Settings</h3>
+            <button className="btn" onClick={onClose}>
+              Close
+            </button>
+          </div>
+
+          <div className="panel">
+            <h4>Display</h4>
+            <label>
+              <input
+                type="checkbox"
+                checked={settings.showTitle}
+                onChange={(e) =>
+                  setSettings({ ...settings, showTitle: e.target.checked })
+                }
+              />{" "}
+              Show title
+            </label>
+            <br />
+            <label>
+              <input
+                type="checkbox"
+                checked={settings.showAuthors}
+                onChange={(e) =>
+                  setSettings({ ...settings, showAuthors: e.target.checked })
+                }
+              />{" "}
+              Show authors
+            </label>
+            <br />
+            <label>
+              <input
+                type="checkbox"
+                checked={settings.showGenre}
+                onChange={(e) =>
+                  setSettings({ ...settings, showGenre: e.target.checked })
+                }
+              />{" "}
+              Show genre
+            </label>
+          </div>
+
+          <div className="panel">
+            <h4>Playback</h4>
+            <label title="When enabled, selecting a song starts playback immediately (except the first auto-loaded song)">
+              <input
+                type="checkbox"
+                checked={settings.instantPlayback}
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  setSettings({ ...settings, instantPlayback: next });
+                  pushStatus(
+                    <span>
+                      Instant Playback toggled <b>{next ? "on" : "off"}</b>
+                    </span>
+                  );
+                }}
+              />{" "}
+              Instant playback on selection
+            </label>
+            <div style={{ color: "#666", marginTop: 6, fontSize: 13 }}>
+              Shortcut: ⌘⇧P
+            </div>
+          </div>
         </div>
-      )}
+
+        {/* Right sidebar: keyboard shortcuts */}
+        <div className="panel" style={{ overflow: "auto" }}>
+          <h4>Keyboard shortcuts</h4>
+          <div className="col" style={{ gap: 6 }}>
+            {shortcuts.map((s) => (
+              <div
+                key={s.label}
+                className="row"
+                style={{ justifyContent: "space-between" }}
+              >
+                <div>{s.label}</div>
+                <div style={{ opacity: 0.8 }}>{s.keys}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -851,6 +955,13 @@ export default function App() {
   const [folder, setFolder] = useState<string | null>(null);
   const [tagsFile, setTagsFile] = useState<TagsFile>(emptyTags());
   const [showManager, setShowManager] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [settings, setSettings] = useState<Settings>({
+    showTitle: true,
+    showAuthors: true,
+    showGenre: true,
+    instantPlayback: false,
+  });
 
   useEffect(() => {
     initSession();
@@ -858,6 +969,30 @@ export default function App() {
       const raw = await readTagsFile();
       setTagsFile(JSON.parse(raw));
     })();
+  }, []);
+
+  // Global shortcuts: ⌘+, opens settings; ⌘⇧P toggles instant playback
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const k = e.key.toLowerCase();
+      if (e.metaKey && !e.shiftKey && k === ",") {
+        e.preventDefault();
+        setShowSettings((open) => !open);
+      } else if (e.metaKey && e.shiftKey && k === "p") {
+        e.preventDefault();
+        setSettings((s) => {
+          const next = !s.instantPlayback;
+          pushStatus(
+            <span>
+              Instant Playback toggled <b>{next ? "on" : "off"}</b>
+            </span>
+          );
+          return { ...s, instantPlayback: next };
+        });
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   async function handleOpenFolder() {
@@ -879,6 +1014,7 @@ export default function App() {
         <StartScreen
           onOpenFolder={handleOpenFolder}
           onManageTags={() => setShowManager(true)}
+          onOpenSettings={() => setShowSettings(true)}
         />
       ) : (
         <SongTagging
@@ -886,8 +1022,18 @@ export default function App() {
           onBack={() => setScreen("start")}
           tagsFile={tagsFile}
           setTagsFile={setTagsFile}
+          settings={settings}
+          onOpenSettings={() => setShowSettings(true)}
         />
       )}
+      {showSettings && (
+        <GlobalSettingsModal
+          settings={settings}
+          setSettings={setSettings}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+
       {showManager && (
         <TagManager
           tags={tagsFile}
@@ -899,6 +1045,7 @@ export default function App() {
           onClose={() => setShowManager(false)}
         />
       )}
+      <StatusViewport />
     </AppErrorBoundary>
   );
 }

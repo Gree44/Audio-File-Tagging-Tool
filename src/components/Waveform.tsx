@@ -27,6 +27,7 @@ export default function Waveform({
   const wsRef = useRef<WaveSurfer | null>(null);
   const triedBlobRef = useRef(false); // avoid infinite fallback loops
   const blobUrlRef = useRef<string | null>(null); // revoke on cleanup/switch
+  const playingRef = useRef(playing);
 
   const [duration, setDuration] = useState(0);
   const [time, setTime] = useState(0);
@@ -37,6 +38,10 @@ export default function Waveform({
       audioRef.current.volume = Math.max(0, Math.min(1, volume));
     }
   }, [volume]);
+
+  useEffect(() => {
+    playingRef.current = playing;
+  }, [playing]);
 
   useEffect(() => {
     // reset visuals immediately so old track doesn't linger
@@ -101,6 +106,16 @@ export default function Waveform({
           setDuration(dur);
           onReady?.(dur);
           onWaveLoading?.(false);
+          // If user requested playback before WS became ready, start now
+          if (playingRef.current) {
+            // ensure element volume and kick playback
+            try {
+              audio.play().catch(() => {});
+            } catch {}
+            try {
+              ws.play();
+            } catch {}
+          }
         });
         ws.on("timeupdate", (t) => {
           setTime(t);
@@ -144,7 +159,18 @@ export default function Waveform({
       return null;
     };
 
-    const onCanPlay = () => onAudioLoading?.(false);
+    const onCanPlay = () => {
+      onAudioLoading?.(false);
+      // Some browsers gate play() on canplay; honor queued intent here too
+      if (playingRef.current) {
+        try {
+          audio.play().catch(() => {});
+        } catch {}
+        try {
+          wsRef.current?.play();
+        } catch {}
+      }
+    };
 
     const onError = async (e: any) => {
       console.error("[audio] error", e);

@@ -3,19 +3,20 @@
 use tauri::{api::{dialog::blocking::FileDialogBuilder, path::app_data_dir}};
 use serde::Serialize;
 use lofty::{Accessor, ItemKey, PictureType, TaggedFileExt, TagType, Tag, AudioFile};
-use std::{fs, path::PathBuf, io::Write};
+use std::{fs, path::{Path, PathBuf}, io::Write};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use chrono::Local;
 use base64::{engine::general_purpose, Engine as _};
 
-use std::{convert::Infallible, io::{self, SeekFrom}, path::Path};
+use std::{convert::Infallible, io};
 
-use hyper::{Body, Request, Response, Server, StatusCode, header};
+use hyper::{Body, Request, Response, Server, StatusCode, header, Method};
+use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::{make_service_fn, service_fn};
-use tokio::{fs::File, io::{AsyncSeekExt, AsyncReadExt}};
-use tokio_util::io::ReaderStream;
-use mime_guess::from_path;
+use tokio::io::AsyncSeekExt;
+
+
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use tauri::Manager;
 
@@ -54,7 +55,7 @@ fn logs_dir() -> PathBuf { let mut p = data_dir(); p.push("logs"); p }
 
 #[tauri::command]
 fn init_session() -> Result<(), String> {
-  fs::create_dir_all(&logs_dir()).map_err(|e| e.to_string())?;
+  fs::create_dir_all(logs_dir()).map_err(|e| e.to_string())?;
   let name = Local::now().format("%Y%m%d_%H%M%S.log").to_string();
   let mut p = logs_dir(); p.push(name);
   *LOG_PATH.lock() = Some(p.clone());
@@ -73,8 +74,8 @@ fn log_event(message: String) { log_line(&message); }
 #[tauri::command]
 fn choose_folder() -> Option<String> { FileDialogBuilder::new().pick_folder().map(|p| p.to_string_lossy().to_string()) }
 
-fn supported_ext(p: &PathBuf) -> bool {
-  if let Some(ext) = p.extension().and_then(|e| e.to_str()) { match ext.to_lowercase().as_str() {"mp3"|"flac"|"wav"|"aiff"|"aif"|"m4a" => true, _ => false} } else { false }
+fn supported_ext(p: &Path) -> bool {
+  if let Some(ext) = p.extension().and_then(|e| e.to_str()) { matches!(ext.to_lowercase().as_str(), "mp3"|"flac"|"wav"|"aiff"|"aif"|"m4a") } else { false }
 }
 
 #[tauri::command]
@@ -160,10 +161,45 @@ fn write_tags_file(json: String) -> Result<(), String> {
   Ok(())
 }
 
+fn add_cors_headers(headers: &mut hyper::HeaderMap) {
+  headers.insert(
+    HeaderName::from_static("access-control-allow-origin"),
+    HeaderValue::from_static("*"),
+  );
+  headers.insert(
+    HeaderName::from_static("access-control-allow-methods"),
+    HeaderValue::from_static("GET,HEAD,OPTIONS"),
+  );
+  headers.insert(
+    HeaderName::from_static("access-control-allow-headers"),
+    HeaderValue::from_static("*"),
+  );
+  headers.insert(
+    HeaderName::from_static("vary"),
+    HeaderValue::from_static("Origin"),
+  );
+}
+
+
 async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible> {
   let not_found = || {
-    Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()
+    let mut resp = Response::builder()
+      .status(StatusCode::NOT_FOUND)
+      .body(Body::empty())
+      .unwrap();
+    add_cors_headers(resp.headers_mut());
+    resp
   };
+
+  // CORS preflight
+  if req.method() == Method::OPTIONS {
+    let mut resp = Response::builder()
+      .status(StatusCode::NO_CONTENT)
+      .body(Body::empty())
+      .unwrap();
+    add_cors_headers(resp.headers_mut());
+    return Ok(resp);
+  }
 
   let uri = req.uri();
   if uri.path() != "/audio" {
@@ -176,7 +212,10 @@ async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible
     .and_then(|q| q.split('&').find(|p| p.starts_with("path=")))
     .and_then(|kv| kv.split_once('=').map(|(_, v)| v.to_string()))
     .and_then(|enc| {
-      percent_encoding::percent_decode_str(&enc).decode_utf8().ok().map(|s| s.into_owned())
+      percent_encoding::percent_decode_str(&enc)
+        .decode_utf8()
+        .ok()
+        .map(|s| s.into_owned())
     });
 
   let path = match path {
@@ -184,11 +223,11 @@ async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible
     None => return Ok(not_found()),
   };
 
-  if !Path::new(&path).exists() {
+  if !std::path::Path::new(&path).exists() {
     return Ok(not_found());
   }
 
-  let mut file = match File::open(&path).await {
+  let mut file = match tokio::fs::File::open(&path).await {
     Ok(f) => f,
     Err(_) => return Ok(not_found()),
   };
@@ -197,7 +236,7 @@ async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible
     Err(_) => return Ok(not_found()),
   };
   let file_len = meta.len();
-  let mime = from_path(&path).first_or_octet_stream();
+  let mime = mime_guess::from_path(&path).first_or_octet_stream();
 
   let mut status = StatusCode::OK;
   let mut start: u64 = 0;
@@ -215,31 +254,53 @@ async fn media_response(req: Request<Body>) -> Result<Response<Body>, Infallible
       if start <= end {
         status = StatusCode::PARTIAL_CONTENT;
       } else {
-        return Ok(Response::builder().status(StatusCode::RANGE_NOT_SATISFIABLE).body(Body::empty()).unwrap());
+        let mut resp = Response::builder()
+          .status(StatusCode::RANGE_NOT_SATISFIABLE)
+          .body(Body::empty())
+          .unwrap();
+        add_cors_headers(resp.headers_mut());
+        return Ok(resp);
       }
     }
   }
 
-  // Seek and stream only the requested range
-  if let Err(_) = file.seek(SeekFrom::Start(start)).await {
+  // HEAD: send headers only (faster for WaveSurfer's probes, if any)
+  if req.method() == Method::HEAD {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = status;
+    let headers = resp.headers_mut();
+    add_cors_headers(headers);
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap());
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if status == StatusCode::PARTIAL_CONTENT {
+      let cr = format!("bytes {}-{}/{}", start, end, file_len);
+      headers.insert(header::CONTENT_RANGE, HeaderValue::from_str(&cr).unwrap());
+    }
+    return Ok(resp);
+  }
+
+  // GET: stream the requested range
+  if (file.seek(std::io::SeekFrom::Start(start)).await).is_err() {
     return Ok(not_found());
   }
   let to_read = end - start + 1;
-  let reader = file.take(to_read);                 // requires AsyncReadExt in scope
-  let stream = ReaderStream::new(reader);
-  let body = Body::wrap_stream(stream);            // requires hyper feature "stream"
+  let reader = tokio::io::AsyncReadExt::take(file, to_read);
+  let stream = tokio_util::io::ReaderStream::new(reader);
+  let body = Body::wrap_stream(stream);
 
   let mut resp = Response::new(body);
   *resp.status_mut() = status;
   let headers = resp.headers_mut();
-  headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_str(mime.as_ref()).unwrap());
-  headers.insert(header::ACCEPT_RANGES, header::HeaderValue::from_static("bytes"));
+  add_cors_headers(headers);
+  headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(mime.as_ref()).unwrap());
+  headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
   if status == StatusCode::PARTIAL_CONTENT {
     let cr = format!("bytes {}-{}/{}", start, end, file_len);
-    headers.insert(header::CONTENT_RANGE, header::HeaderValue::from_str(&cr).unwrap());
+    headers.insert(header::CONTENT_RANGE, HeaderValue::from_str(&cr).unwrap());
   }
   Ok(resp)
 }
+
 
 
 async fn start_media_server() -> io::Result<u16> {
@@ -252,7 +313,7 @@ async fn start_media_server() -> io::Result<u16> {
   });
 
   let server = Server::from_tcp(std_listener)
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    .map_err(io::Error::other)?
     .serve(make);
 
   tauri::async_runtime::spawn(async move {
