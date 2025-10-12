@@ -5,10 +5,15 @@ import {
   scanFolder,
   readMetadata,
   writeComment,
-  readTagsFile,
   writeTagsFile,
   logEvent,
   getMediaUrl,
+  readTagsFileBank,
+  writeTagsFileBank,
+  listTagBanks,
+  getLastUsedBank,
+  setLastUsedBank,
+  sanitizeBank,
 } from "./tauri";
 import Waveform from "./components/Waveform";
 import { TagDef, TagsFile, TrackMeta, Settings } from "./types";
@@ -21,6 +26,7 @@ import {
   validateTagName,
   ensureAtLeastOneMain,
   dedupeById,
+  coerceTagsFile,
 } from "./lib/tags";
 import { StatusViewport, pushStatus } from "./ui/Status";
 
@@ -55,10 +61,18 @@ function StartScreen({
   onOpenFolder,
   onManageTags,
   onOpenSettings,
+  banks,
+  bank,
+  onSelectBank,
+  onCreateBank,
 }: {
   onOpenFolder: () => void;
   onManageTags: () => void;
   onOpenSettings: () => void;
+  banks: string[];
+  bank: string;
+  onSelectBank: (b: string) => void;
+  onCreateBank: () => void;
 }) {
   useHotkeys({ o: () => onOpenFolder(), "+": () => onManageTags() });
   return (
@@ -69,11 +83,38 @@ function StartScreen({
           <button className="btn" onClick={onManageTags}>
             Manage Tags <span className="kbd">+</span>
           </button>
-          <button className="btn" onClick={onOpenSettings}>
-            Settings ⚙️
-          </button>
+
+          <label className="row" style={{ gap: 6, alignItems: "center" }}>
+            <span style={{ fontSize: 12, color: "#555" }}>Tag bank</span>
+            <select
+              value={bank}
+              onChange={(e) => {
+                const val = e.currentTarget.value;
+                if (val === "__new__") {
+                  // revert selection and open modal
+                  e.currentTarget.value = bank;
+                  onCreateBank();
+                } else {
+                  onSelectBank(val);
+                }
+              }}
+              style={{ padding: 6 }}
+            >
+              {banks.map((b) => (
+                <option key={b} value={b}>
+                  {b}
+                </option>
+              ))}
+              <option value="__new__">➕ New bank…</option>
+            </select>
+          </label>
+
           <button className="btn primary" onClick={onOpenFolder}>
             Open Folder <span className="kbd">o</span>
+          </button>
+
+          <button className="btn" onClick={onOpenSettings}>
+            Settings ⚙️
           </button>
         </div>
       </div>
@@ -333,6 +374,10 @@ function SongTagging({
   setTagsFile,
   settings,
   onOpenSettings,
+  bank,
+  banks,
+  onSelectBank,
+  onCreateBank,
 }: {
   folder: string;
   onBack: () => void;
@@ -340,6 +385,10 @@ function SongTagging({
   setTagsFile: (t: TagsFile) => void;
   settings: Settings;
   onOpenSettings: () => void;
+  bank: string;
+  banks: string[];
+  onSelectBank: (b: string) => void;
+  onCreateBank: () => void;
 }) {
   // ---- Stable hook order (these never change across renders) ----
   const [files, setFiles] = useState<{ path: string; fileName: string }[]>([]);
@@ -617,6 +666,32 @@ function SongTagging({
             <button className="btn" onClick={() => setShowManager(true)}>
               Manage Tags <span className="kbd">+</span>
             </button>
+
+            <label className="row" style={{ gap: 6, alignItems: "center" }}>
+              <span style={{ fontSize: 12, color: "#555" }}>Tag bank</span>
+              <select
+                value={bank}
+                onChange={(e) => {
+                  const val = e.currentTarget.value;
+                  if (val === "__new__") {
+                    // revert selection and open modal
+                    e.currentTarget.value = bank;
+                    onCreateBank();
+                  } else {
+                    onSelectBank(val);
+                  }
+                }}
+                style={{ padding: 6 }}
+              >
+                {banks.map((b) => (
+                  <option key={b} value={b}>
+                    {b}
+                  </option>
+                ))}
+                <option value="__new__">➕ New bank…</option>
+              </select>
+            </label>
+
             <button className="btn" onClick={onOpenSettings}>
               Settings ⚙️
             </button>
@@ -962,14 +1037,33 @@ export default function App() {
     showGenre: true,
     instantPlayback: false,
   });
+  const [banks, setBanks] = useState<string[]>(["default"]);
+  const [bank, setBank] = useState<string>("default");
+  const [showNewBank, setShowNewBank] = useState(false);
+  const [pendingBankName, setPendingBankName] = useState("");
 
   useEffect(() => {
     initSession();
     (async () => {
-      const raw = await readTagsFile();
-      setTagsFile(JSON.parse(raw));
+      const list = await listTagBanks().catch(() => ["default"]);
+      setBanks(list.length ? list : ["default"]);
+      const last = (await getLastUsedBank()) || "default";
+      const chosen = list.includes(last) ? last : "default";
+      setBank(chosen);
+
+      // load tags for chosen bank
+      const raw = await readTagsFileBank(chosen);
+      setTagsFile(coerceTagsFile(JSON.parse(raw)));
     })();
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      await setLastUsedBank(bank);
+      const raw = await readTagsFileBank(bank);
+      setTagsFile(coerceTagsFile(JSON.parse(raw)));
+    })();
+  }, [bank]);
 
   // Global shortcuts: ⌘+, opens settings; ⌘⇧P toggles instant playback
   useEffect(() => {
@@ -1008,6 +1102,34 @@ export default function App() {
     }
   }
 
+  function handleSelectBank(next: string) {
+    if (!next) return;
+    setBank(next);
+  }
+
+  function handleCreateBank() {
+    setPendingBankName("");
+    setShowNewBank(true);
+  }
+
+  async function finalizeCreateBank(rawName: string) {
+    const name = sanitizeBank(rawName);
+    if (!name) return;
+    // already exists? just switch
+    if (banks.includes(name)) {
+      setBank(name);
+      setShowNewBank(false);
+      return;
+    }
+    // create empty file and refresh list
+    await writeTagsFileBank(name, JSON.stringify(emptyTags()));
+    const list = await listTagBanks().catch(() => []);
+    setBanks(list.length ? list : ["default"]);
+    setBank(name);
+    await setLastUsedBank(name);
+    setShowNewBank(false);
+  }
+
   return (
     <AppErrorBoundary>
       {screen === "start" ? (
@@ -1015,6 +1137,10 @@ export default function App() {
           onOpenFolder={handleOpenFolder}
           onManageTags={() => setShowManager(true)}
           onOpenSettings={() => setShowSettings(true)}
+          banks={banks}
+          bank={bank}
+          onSelectBank={handleSelectBank}
+          onCreateBank={handleCreateBank}
         />
       ) : (
         <SongTagging
@@ -1022,6 +1148,10 @@ export default function App() {
           onBack={() => setScreen("start")}
           tagsFile={tagsFile}
           setTagsFile={setTagsFile}
+          bank={bank}
+          banks={banks}
+          onSelectBank={handleSelectBank}
+          onCreateBank={handleCreateBank}
           settings={settings}
           onOpenSettings={() => setShowSettings(true)}
         />
@@ -1039,13 +1169,105 @@ export default function App() {
           tags={tagsFile}
           setTags={async (tf) => {
             setTagsFile(tf);
-            await writeTagsFile(JSON.stringify(tf));
+            await writeTagsFileBank(bank, JSON.stringify(tf));
             await logEvent("write_tags_file");
           }}
           onClose={() => setShowManager(false)}
         />
       )}
+      {showNewBank && (
+        <NewBankModal
+          value={pendingBankName}
+          setValue={setPendingBankName}
+          onCancel={() => setShowNewBank(false)}
+          onCreate={() => finalizeCreateBank(pendingBankName)}
+        />
+      )}
       <StatusViewport />
     </AppErrorBoundary>
+  );
+}
+
+function NewBankModal({
+  value,
+  setValue,
+  onCancel,
+  onCreate,
+}: {
+  value: string;
+  setValue: (s: string) => void;
+  onCancel: () => void;
+  onCreate: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onCancel();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        onCreate();
+      }
+    };
+    const opts = { capture: true } as AddEventListenerOptions;
+    window.addEventListener("keydown", onKey, opts);
+    return () => window.removeEventListener("keydown", onKey, opts);
+  }, [onCancel, onCreate]);
+
+  return (
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onCancel();
+          }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.stopPropagation();
+            onCreate();
+          }
+        }}
+        style={{ maxWidth: 520 }}
+      >
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h3>New Tag Bank</h3>
+          <button className="btn" onClick={onCancel}>
+            Close
+          </button>
+        </div>
+        <div className="panel">
+          <label className="col">
+            Name (letters, numbers, - and _)
+            <input
+              autoFocus
+              value={value}
+              onChange={(e) => setValue(e.currentTarget.value)}
+              placeholder="e.g., edm-bank-01"
+            />
+          </label>
+          <div style={{ marginTop: 8, color: "#666", fontSize: 13 }}>
+            Will be saved as{" "}
+            <code>tags.{sanitizeBank(value || "default")}.json</code> in
+            <br />
+            <code>~/Documents/AudioTagger/Banks</code>
+          </div>
+        </div>
+        <div className="row" style={{ gap: 8 }}>
+          <button className="btn primary" onClick={onCreate}>
+            Create <span className="kbd">Enter</span>
+          </button>
+          <button className="btn" onClick={onCancel}>
+            Cancel <span className="kbd">Esc</span>
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

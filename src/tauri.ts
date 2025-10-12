@@ -118,3 +118,31 @@ export async function fileBlobUrl(path: string): Promise<string> {
   const blob = new Blob([arrayBuffer], { type: mimeFor(path) });
   return URL.createObjectURL(blob);
 }
+
+export async function listTagBanks(): Promise<string[]> {
+  return invoke<string[]>("list_tag_banks");
+}
+export async function readTagsFileBank(bank: string): Promise<string> {
+  return invoke<string>("read_tags_file_bank", { bank });
+}
+export async function writeTagsFileBank(
+  bank: string,
+  json: string
+): Promise<void> {
+  return invoke<void>("write_tags_file_bank", { bank, json });
+}
+export async function getLastUsedBank(): Promise<string | null> {
+  return invoke<string | null>("get_last_used_bank");
+}
+export async function setLastUsedBank(bank: string): Promise<void> {
+  return invoke<void>("set_last_used_bank", { bank });
+}
+
+export function sanitizeBank(name: string): string {
+  const out = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return out || "default";
+}

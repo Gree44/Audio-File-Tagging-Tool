@@ -20,9 +20,12 @@ use tokio::io::AsyncSeekExt;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use tauri::Manager;
 
+use serde_json::json;
+use tauri::api::path::document_dir;
 
 
 
+static TAGS_SCHEMA_VERSION: u32 = 1; // also update in src/lib/tags.ts if changed
 
 static LOG_PATH: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
 static WRITE_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -52,6 +55,43 @@ struct AppState {
 fn data_dir() -> PathBuf { app_data_dir(&tauri::Config::default()).unwrap_or(std::env::current_dir().unwrap()) }
 fn tags_file_path() -> PathBuf { let mut p = data_dir(); p.push("tags.json"); p }
 fn logs_dir() -> PathBuf { let mut p = data_dir(); p.push("logs"); p }
+fn banks_dir() -> PathBuf {
+  // ~/Documents/AudioTagger/Banks
+  let base = document_dir()
+    .unwrap_or_else(|| std::env::current_dir().unwrap())
+    .join("AudioTagger")
+    .join("Banks");
+  let _ = fs::create_dir_all(&base);
+  base
+}
+
+fn default_tags_json() -> String {
+  format!(r#"{{ "version": {}, "tags": [] }}"#, TAGS_SCHEMA_VERSION)
+}
+
+
+
+fn sanitize_bank(name: &str) -> String {
+  let s = name.trim().to_lowercase();
+  let mut out = String::with_capacity(s.len());
+  for ch in s.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { out.push(ch); }
+    else if ch.is_whitespace() { out.push('-'); }
+  }
+  let out = out.trim_matches('-').to_string();
+  if out.is_empty() { "default".into() } else { out }
+}
+
+fn bank_path(name: &str) -> PathBuf {
+  banks_dir().join(format!("tags.{}.json", sanitize_bank(name)))
+}
+
+fn prefs_path() -> PathBuf {
+  let base = data_dir();
+  let _ = fs::create_dir_all(&base);
+  base.join("prefs.json")
+}
+
 
 #[tauri::command]
 fn init_session() -> Result<(), String> {
@@ -145,12 +185,12 @@ fn write_comment(path: String, comment: String) -> Result<(), String> {
 
 }
 
-#[tauri::command]
-fn read_tags_file() -> Result<String, String> {
-  let p = tags_file_path();
-  if !p.exists() { let default = serde_json::json!({"version":1,"tags":[]}); fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?; fs::write(&p, serde_json::to_vec_pretty(&default).unwrap()).map_err(|e| e.to_string())?; }
-  let s = fs::read_to_string(&p).map_err(|e| e.to_string())?; Ok(s)
-}
+// #[tauri::command]
+// fn read_tags_file() -> Result<String, String> {
+//   let p = tags_file_path();
+//   if !p.exists() { let default = serde_json::json!({"version":1,"tags":[]}); fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?; fs::write(&p, serde_json::to_vec_pretty(&default).unwrap()).map_err(|e| e.to_string())?; }
+//   let s = fs::read_to_string(&p).map_err(|e| e.to_string())?; Ok(s)
+// }
 
 #[tauri::command]
 fn write_tags_file(json: String) -> Result<(), String> {
@@ -160,6 +200,67 @@ fn write_tags_file(json: String) -> Result<(), String> {
   log_line("write_tags_file");
   Ok(())
 }
+
+#[tauri::command]
+fn list_tag_banks() -> Result<Vec<String>, String> {
+  let base = banks_dir();
+  let mut out = Vec::new();
+  if let Ok(rd) = fs::read_dir(&base) {
+    for e in rd.flatten() {
+      let p = e.path();
+      if let (Some(stem), Some(ext)) =
+        (p.file_stem().and_then(|s| s.to_str()), p.extension().and_then(|e| e.to_str()))
+      {
+        if ext == "json" && stem.starts_with("tags.") {
+          out.push(stem.trim_start_matches("tags.").to_string());
+        }
+      }
+    }
+  }
+  if !out.iter().any(|s| s == "default") {
+    out.push("default".into());
+  }
+  out.sort();
+  Ok(out)
+}
+
+#[tauri::command]
+fn read_tags_file_bank(bank: String) -> Result<String, String> {
+  let path = bank_path(&bank);
+  match fs::read_to_string(&path) {
+    Ok(s) => Ok(s),
+    Err(_) => {
+      let empty = default_tags_json();
+      let _ = fs::write(&path, &empty);
+      Ok(empty)
+    }
+  }
+}
+
+#[tauri::command]
+fn write_tags_file_bank(bank: String, json: String) -> Result<(), String> {
+  let path = bank_path(&bank);
+  fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_last_used_bank() -> Option<String> {
+  let p = prefs_path();
+  if let Ok(s) = fs::read_to_string(p) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+      return v.get("last_bank").and_then(|x| x.as_str()).map(|s| s.to_string());
+    }
+  }
+  None
+}
+
+#[tauri::command]
+fn set_last_used_bank(bank: String) -> Result<(), String> {
+  let p = prefs_path();
+  let val = serde_json::json!({ "last_bank": sanitize_bank(&bank) });
+  fs::write(p, val.to_string()).map_err(|e| e.to_string())
+}
+
 
 fn add_cors_headers(headers: &mut hyper::HeaderMap) {
   headers.insert(
@@ -337,7 +438,8 @@ fn media_url_for_path(path: String, state: tauri::State<AppState>) -> String {
 pub fn main() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
-      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, read_tags_file, write_tags_file, media_url_for_path
+      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, /*read_tags_file,*/ write_tags_file, media_url_for_path, list_tag_banks, read_tags_file_bank, write_tags_file_bank,
+  get_last_used_bank, set_last_used_bank
     ])
     .setup(|app| {
     tauri::async_runtime::block_on(async {
