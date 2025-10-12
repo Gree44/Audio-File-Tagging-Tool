@@ -14,6 +14,8 @@ import {
   getLastUsedBank,
   setLastUsedBank,
   sanitizeBank,
+  readSettings,
+  writeSettings,
 } from "./tauri";
 import Waveform from "./components/Waveform";
 import { TagDef, TagsFile, TrackMeta, Settings } from "./types";
@@ -1045,6 +1047,14 @@ export default function App() {
   useEffect(() => {
     initSession();
     (async () => {
+      // 1) Load settings first (fallback to defaults if error)
+      try {
+        const s = await readSettings();
+        setSettings(s);
+      } catch {
+        /* use defaults */
+      }
+      // 2) Load banks + last used bank + tags
       const list = await listTagBanks().catch(() => ["default"]);
       setBanks(list.length ? list : ["default"]);
       const last = (await getLastUsedBank()) || "default";
@@ -1064,6 +1074,13 @@ export default function App() {
       setTagsFile(coerceTagsFile(JSON.parse(raw)));
     })();
   }, [bank]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      writeSettings(settings).catch(() => {});
+    }, 200);
+    return () => clearTimeout(t);
+  }, [settings]);
 
   // Global shortcuts: ⌘+, opens settings; ⌘⇧P toggles instant playback
   useEffect(() => {

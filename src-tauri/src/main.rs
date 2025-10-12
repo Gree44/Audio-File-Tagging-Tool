@@ -1,7 +1,6 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use tauri::{api::{dialog::blocking::FileDialogBuilder, path::app_data_dir}};
-use serde::Serialize;
 use lofty::{Accessor, ItemKey, PictureType, TaggedFileExt, TagType, Tag, AudioFile};
 use std::{fs, path::{Path, PathBuf}, io::Write};
 use once_cell::sync::Lazy;
@@ -22,6 +21,8 @@ use tauri::Manager;
 
 use serde_json::json;
 use tauri::api::path::document_dir;
+
+use serde::{Deserialize, Serialize};
 
 
 
@@ -69,6 +70,14 @@ fn default_tags_json() -> String {
   format!(r#"{{ "version": {}, "tags": [] }}"#, TAGS_SCHEMA_VERSION)
 }
 
+fn documents_root() -> PathBuf {
+  // ~/Documents/AudioTagger
+  let base = document_dir()
+    .unwrap_or(std::env::current_dir().unwrap())
+    .join("AudioTagger");
+  let _ = std::fs::create_dir_all(&base);
+  base
+}
 
 
 fn sanitize_bank(name: &str) -> String {
@@ -87,9 +96,75 @@ fn bank_path(name: &str) -> PathBuf {
 }
 
 fn prefs_path() -> PathBuf {
-  let base = data_dir();
-  let _ = fs::create_dir_all(&base);
-  base.join("prefs.json")
+  documents_root().join("prefs.json")
+}
+
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Settings {
+  show_title: bool,
+  show_authors: bool,
+  show_genre: bool,
+  instant_playback: bool,
+}
+
+impl Default for Settings {
+  fn default() -> Self {
+    Self {
+      show_title: true,
+      show_authors: true,
+      show_genre: true,
+      instant_playback: false,
+    }
+  }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Prefs {
+  last_used_bank: Option<String>,
+  settings: Option<Settings>,
+}
+
+
+
+fn load_prefs() -> Prefs {
+  let path = prefs_path();
+  match std::fs::read_to_string(&path) {
+    Ok(s) => {
+      // Robust to old formats: if it’s valid JSON, parse Prefs;
+      // otherwise treat content as legacy last_used_bank string.
+      if s.trim_start().starts_with('{') {
+        serde_json::from_str::<Prefs>(&s).unwrap_or_default()
+      } else {
+        Prefs { last_used_bank: Some(s.trim().to_string()), settings: None }
+      }
+    }
+    Err(_) => Prefs::default(),
+  }
+}
+
+fn save_prefs(p: &Prefs) -> Result<(), String> {
+  let path = prefs_path();
+  let json = serde_json::to_string_pretty(p).map_err(|e| e.to_string())?;
+  std::fs::write(&path, json).map_err(|e| e.to_string())
+}
+
+//////////////////// commands ////////////////////
+
+#[tauri::command]
+fn read_settings() -> Result<Settings, String> {
+  let p = load_prefs();
+  Ok(p.settings.unwrap_or_default())
+}
+
+#[tauri::command]
+fn write_settings(settings: Settings) -> Result<(), String> {
+  let mut p = load_prefs();
+  p.settings = Some(settings);
+  save_prefs(&p)
 }
 
 
@@ -244,22 +319,17 @@ fn write_tags_file_bank(bank: String, json: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_last_used_bank() -> Option<String> {
-  let p = prefs_path();
-  if let Ok(s) = fs::read_to_string(p) {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-      return v.get("last_bank").and_then(|x| x.as_str()).map(|s| s.to_string());
-    }
-  }
-  None
+fn get_last_used_bank() -> Result<Option<String>, String> {
+  Ok(load_prefs().last_used_bank)
 }
 
 #[tauri::command]
 fn set_last_used_bank(bank: String) -> Result<(), String> {
-  let p = prefs_path();
-  let val = serde_json::json!({ "last_bank": sanitize_bank(&bank) });
-  fs::write(p, val.to_string()).map_err(|e| e.to_string())
+  let mut p = load_prefs();
+  p.last_used_bank = Some(bank);
+  save_prefs(&p)
 }
+
 
 
 fn add_cors_headers(headers: &mut hyper::HeaderMap) {
@@ -438,7 +508,10 @@ fn media_url_for_path(path: String, state: tauri::State<AppState>) -> String {
 pub fn main() {
   tauri::Builder::default()
     .invoke_handler(tauri::generate_handler![
-      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, /*read_tags_file,*/ write_tags_file, media_url_for_path, list_tag_banks, read_tags_file_bank, write_tags_file_bank,
+      init_session, log_event, choose_folder, scan_folder, read_metadata, write_comment, write_tags_file, media_url_for_path, list_tag_banks, read_tags_file_bank, write_tags_file_bank, read_settings,
+   write_settings,
+   get_last_used_bank,
+   set_last_used_bank,
   get_last_used_bank, set_last_used_bank
     ])
     .setup(|app| {

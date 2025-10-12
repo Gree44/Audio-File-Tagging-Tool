@@ -2,6 +2,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/tauri";
 import { open } from "@tauri-apps/api/dialog";
 import type { TrackMeta } from "./types";
 import { readBinaryFile } from "@tauri-apps/api/fs";
+import type { Settings } from "./types";
 
 export async function initSession(): Promise<void> {
   await invoke<void>("init_session");
@@ -145,4 +146,19 @@ export function sanitizeBank(name: string): string {
     .replace(/[^\w-]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return out || "default";
+}
+
+export async function readSettings(): Promise<Settings> {
+  const s = await invoke<any>("read_settings");
+  // fields are camelCase from Rust via serde(rename_all)
+  return {
+    showTitle: !!s.showTitle,
+    showAuthors: !!s.showAuthors,
+    showGenre: !!s.showGenre,
+    instantPlayback: !!s.instantPlayback,
+  };
+}
+
+export async function writeSettings(s: Settings): Promise<void> {
+  await invoke<void>("write_settings", { settings: s });
 }
