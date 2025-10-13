@@ -1,7 +1,7 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use tauri::{api::{dialog::blocking::FileDialogBuilder, path::app_data_dir}};
-use lofty::{Accessor, ItemKey, PictureType, TaggedFileExt, TagType, Tag, AudioFile};
+use lofty::{Accessor, ItemKey, PictureType, TaggedFileExt, TagType, Tag};
 use std::{fs, path::{Path, PathBuf}, io::Write};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -13,7 +13,8 @@ use std::{convert::Infallible, io};
 use hyper::{Body, Request, Response, Server, StatusCode, header, Method};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::{make_service_fn, service_fn};
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncSeekExt, AsyncReadExt};
+use tokio_util::io::ReaderStream;
 
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -216,56 +217,157 @@ fn read_picture_data_url(tf: &lofty::TaggedFile) -> Option<String> {
 
 #[tauri::command]
 fn read_metadata(path: String) -> Result<TrackMeta, String> {
+  use lofty::{ItemKey, TagType};
+  use std::path::PathBuf;
+
   let p = PathBuf::from(&path);
   let tf = lofty::read_from_path(&p).map_err(|e| e.to_string())?;
-  let tag = tf.primary_tag().or_else(|| tf.first_tag());
-  let title = tag.and_then(|t| t.title().map(|s| s.to_string()));
-  let mut artists = vec![]; if let Some(t) = tag { if let Some(a) = t.artist() { artists.push(a.to_string()) } }
-  let genre = tag.and_then(|t| t.genre().map(|s| s.to_string()));
-  let comment = tag.and_then(|t| t.get_string(&ItemKey::Comment).map(|s| s.to_string())).unwrap_or_default();
+
+  // Prefer the tag types that Rekordbox/Engine DJ use for each format.
+  let ext = p
+    .extension()
+    .and_then(|s| s.to_str())
+    .unwrap_or("")
+    .to_ascii_lowercase();
+
+  let order: &[TagType] = match ext.as_str() {
+    "mp3" | "aif" | "aiff" => &[TagType::Id3v2],
+    "flac" => &[TagType::VorbisComments],
+    "m4a" | "mp4" | "alac" => &[TagType::Mp4Ilst],
+    "wav" => &[TagType::RiffInfo, TagType::Id3v2],
+    _ => &[],
+  };
+
+  // Helper: get the first available tag in our preferred order, else primary.
+  let preferred_tag = order
+    .iter()
+    .find_map(|tt| tf.tag(*tt))
+    .or_else(|| tf.primary_tag());
+
+  // Fields from the preferred tag (with graceful fallback).
+  let title = preferred_tag
+    .and_then(|t| t.title().map(|s| s.to_string()));
+
+  let mut artists: Vec<String> = Vec::new();
+  if let Some(t) = preferred_tag {
+    if let Some(a) = t.artist() {
+      artists.push(a.to_string());
+    }
+  }
+
+  let genre = preferred_tag
+    .and_then(|t| t.genre().map(|s| s.to_string()));
+
+  // Comment: try preferred order; if missing, fall back to primary.
+  let mut comment: Option<String> = None;
+  for tt in order {
+    if let Some(tag) = tf.tag(*tt) {
+      if let Some(s) = tag.get_string(&ItemKey::Comment) {
+        comment = Some(s.to_string());
+        break;
+      }
+    }
+  }
+  if comment.is_none() {
+    if let Some(tag) = tf.primary_tag() {
+      if let Some(s) = tag.get_string(&ItemKey::Comment) {
+        comment = Some(s.to_string());
+      }
+    }
+  }
+  let comment = comment.unwrap_or_default();
+
+  // Picture & format
   let pic = read_picture_data_url(&tf);
-  let format = p.extension().and_then(|e| e.to_str()).map(|s| s.to_uppercase());
+  let format = p
+    .extension()
+    .and_then(|e| e.to_str())
+    .map(|s| s.to_uppercase());
+
   Ok(TrackMeta {
     path: path.clone(),
-    file_name: p.file_name().unwrap().to_string_lossy().to_string(),
-    title, artists, genre, comment,
+    file_name: p
+      .file_name()
+      .map(|s| s.to_string_lossy().to_string())
+      .unwrap_or_else(|| path.clone()),
+    title,
+    artists,
+    genre,
+    comment,
     picture_data_url: pic,
     format,
-    })
-  }
+  })
+}
+
+#[inline]
+fn save_tagged_file_to_path(tf: &lofty::TaggedFile, path: &std::path::Path) -> Result<(), String> {
+  <lofty::TaggedFile as lofty::AudioFile>::save_to_path(tf, path)
+    .map_err(|e| e.to_string())
+}
+
+
+
 
 #[tauri::command]
 fn write_comment(path: String, comment: String) -> Result<(), String> {
-  let _guard = WRITE_LOCK.lock();
+  use std::path::PathBuf;
+
   let p = PathBuf::from(&path);
-  let mut tf = lofty::read_from_path(&p).map_err(|e| e.to_string())?;
+  let mut tf: lofty::TaggedFile = lofty::read_from_path(&p).map_err(|e| e.to_string())?;
 
-  // choose an existing primary tag if possible, else create one
-  let tag_type = tf.primary_tag().map(|t| t.tag_type()).unwrap_or(TagType::Id3v2);
 
-  if let Some( tag_ref) = tf.primary_tag_mut() {
-    // write into the existing primary tag
-    tag_ref.insert_text(ItemKey::Comment, comment.clone());
-  } else {
-    // create a new tag and insert it
-    let mut tag = Tag::new(tag_type);
-    tag.insert_text(ItemKey::Comment, comment.clone());
-    tf.insert_tag(tag);
+  // choose tag types by format
+  let ext = p
+    .extension()
+    .and_then(|s| s.to_str())
+    .unwrap_or("")
+    .to_ascii_lowercase();
+
+  let targets: &[TagType] = match ext.as_str() {
+    // MP3 / AIFF -> ID3v2 COMM
+    "mp3" | "aif" | "aiff" => &[TagType::Id3v2],
+    // FLAC -> Vorbis COMMENT=
+    "flac" => &[TagType::VorbisComments],
+    // M4A/MP4/ALAC -> MP4 ©cmt (ilst)
+    "m4a" | "mp4" | "alac" => &[TagType::Mp4Ilst],
+    // WAV -> RIFF INFO ICMT and ID3v2 (write both)
+    "wav" => &[TagType::RiffInfo, TagType::Id3v2],
+    // fallback to the file’s primary tag type (no unwrap_or here)
+    _ => &[],
+  };
+
+  let mut wrote_any = false;
+
+  // write to all targeted tag types (creating if absent)
+  for tt in targets {
+    if tf.tag(*tt).is_none() {
+      tf.insert_tag(Tag::new(*tt));
+    }
+    if let Some(tag) = tf.tag_mut(*tt) {
+      tag.insert_text(ItemKey::Comment, comment.clone());
+      wrote_any = true;
+    }
   }
 
-  // persist
-  tf.save_to_path(&p).map_err(|e| e.to_string())?;
-  log_line(&format!("write_comment path=\"{}\"", path));
-  Ok(())
+  // if the format branch didn't match, write to the primary tag type
+  if !wrote_any {
+    let tt = tf.primary_tag_type(); // returns TagType directly
+    if tf.tag(tt).is_none() {
+      tf.insert_tag(Tag::new(tt));
+    }
+    if let Some(tag) = tf.tag_mut(tt) {
+      tag.insert_text(ItemKey::Comment, comment.clone());
+    }
+  }
+
+  // save the file (TaggedFile::save_to takes a path; needs AudioFile trait in scope)
+  save_tagged_file_to_path(&tf, p.as_path())
+
+
 
 }
 
-// #[tauri::command]
-// fn read_tags_file() -> Result<String, String> {
-//   let p = tags_file_path();
-//   if !p.exists() { let default = serde_json::json!({"version":1,"tags":[]}); fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?; fs::write(&p, serde_json::to_vec_pretty(&default).unwrap()).map_err(|e| e.to_string())?; }
-//   let s = fs::read_to_string(&p).map_err(|e| e.to_string())?; Ok(s)
-// }
+
 
 #[tauri::command]
 fn write_tags_file(json: String) -> Result<(), String> {
