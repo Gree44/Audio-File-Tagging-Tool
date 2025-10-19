@@ -5,7 +5,6 @@ import {
   scanFolder,
   readMetadata,
   writeComment,
-  writeTagsFile,
   logEvent,
   getMediaUrl,
   readTagsFileBank,
@@ -29,6 +28,8 @@ import {
   ensureAtLeastOneMain,
   dedupeById,
   coerceTagsFile,
+  unknownTokensFromComment,
+  splitTokens,
 } from "./lib/tags";
 import { StatusViewport, pushStatus } from "./ui/Status";
 
@@ -93,9 +94,8 @@ function StartScreen({
               onChange={(e) => {
                 const val = e.currentTarget.value;
                 if (val === "__new__") {
-                  // revert selection and open modal
-                  e.currentTarget.value = bank;
-                  onCreateBank();
+                  e.currentTarget.value = bank; // revert visual selection
+                  onCreateBank(); // <-- open modal
                 } else {
                   onSelectBank(val);
                 }
@@ -405,6 +405,11 @@ function SongTagging({
   const [waveLoading, setWaveLoading] = useState(false);
   const [mediaUrl, setMediaUrl] = useState<string>(""); // URL we pass to <Waveform>
   const isInitialLoadRef = useRef(true);
+  const [confirmSwitchOpen, setConfirmSwitchOpen] = useState(false);
+  const [pendingAdd, setPendingAdd] = useState<{
+    tag: TagDef;
+    amount: number | null;
+  } | null>(null);
 
   // ---- Hoisted helpers (function declarations avoid TDZ) ----
   async function loadTrackForEntry(entry: { path: string; fileName: string }) {
@@ -420,40 +425,30 @@ function SongTagging({
       console.debug("[loadTrackForEntry] http URL =", newUrl);
       setMediaUrl(newUrl);
 
-      setMediaUrl(newUrl);
-
       // fetch metadata in parallel
       console.time(`[readMetadata] ${entry.fileName}`);
       const m: TrackMeta = await readMetadata(entry.path);
       console.timeEnd(`[readMetadata] ${entry.fileName}`);
       setMeta(m);
 
-      // Normalize AFTER render (non-blocking), using a snapshot
-      const snapshot = { path: entry.path, comment: m.comment || "" };
-      Promise.resolve().then(async () => {
-        try {
-          const parsed = parseCommentToTags(snapshot.comment, tagsFile.tags);
-          const enforced = enforceParentAndMandatory(
-            [...parsed],
-            tagsFile.tags
-          );
-          const normalized = stringifyTagsForComment(enforced);
-          if (normalized !== snapshot.comment) {
-            await writeComment(snapshot.path, normalized);
-            await logEvent(
-              `normalize_on_load path="${snapshot.path}" -> "${normalized}"`
-            );
-            setMeta((prev) =>
-              prev && prev.path === snapshot.path
-                ? { ...prev, comment: normalized }
-                : prev
+      // Warn if comment contains a different TagB than current bank
+      try {
+        const tokens = (m.comment || "")
+          .split(";")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const tagb = tokens.find((t) => t.startsWith("TagB:"));
+        if (tagb) {
+          const fromFile = tagb.slice("TagB:".length);
+          if (fromFile && fromFile !== bank) {
+            pushStatus(
+              <span>
+                This file was tagged with a different bank: <b>{fromFile}</b>
+              </span>
             );
           }
-        } catch (e) {
-          console.error("[normalize] failed:", e);
-          alert("Failed to normalize tags on load: " + e);
         }
-      });
+      } catch {}
     } catch (e) {
       console.error("[readMetadata] failed:", e);
       alert("Failed to read metadata: " + e);
@@ -537,14 +532,41 @@ function SongTagging({
     return parseCommentToTags(meta?.comment || "", tagsFile.tags);
   }
 
-  async function persistTags(chosen: { tag: TagDef; amount: number | null }[]) {
+  async function persistTagsWithBankDecision(
+    chosen: { tag: TagDef; amount: number | null }[],
+    removeUnknowns: boolean,
+    keepUnknowns: boolean
+  ) {
     if (!meta) return;
+
     const final = enforceParentAndMandatory(dedupeById(chosen), tagsFile.tags);
     if (!ensureAtLeastOneMain(final, tagsFile.tags)) {
       alert("At least one MAIN tag is required");
       return;
     }
-    const str = stringifyTagsForComment(final);
+
+    // Base from known tags:
+    let str = stringifyTagsForComment(final);
+
+    // Keep or remove unknowns currently present in the file
+    if (keepUnknowns && !removeUnknowns) {
+      const unknown = unknownTokensFromComment(
+        meta.comment || "",
+        tagsFile.tags
+      );
+      if (unknown.length) {
+        if (str && !str.endsWith(";")) str += ";";
+        str += unknown.map((u) => `${u};`).join("");
+        // ensure single trailing ';' is fine; stringifyTagsForComment already normalizes knowns
+      }
+    }
+    // else (removeUnknowns) => do nothing; unknowns are not appended
+
+    // Ensure TagB:<current_bank>; and replace any existing TagB token
+    const toks = splitTokens(str).filter((t) => !t.startsWith("TagB:"));
+    toks.push(`TagB:${bank}`);
+    str = toks.join(";") + ";";
+
     try {
       await writeComment(meta.path, str);
       await logEvent(`write_comment path="${meta.path}" -> "${str}"`);
@@ -562,17 +584,41 @@ function SongTagging({
       alert("Mandatory tags cannot be removed");
       return;
     }
+
+    // Only intercept when ADDING a tag, there are existing tags from another bank
+    if (!has && bankDiffAndHasTags) {
+      setPendingAdd({ tag: t, amount: t.amountRange ? 0 : null });
+      setConfirmSwitchOpen(true);
+      return;
+    }
+
     if (has) list = list.filter((x) => x.tag.id !== t.id);
     else list.push({ tag: t, amount: t.amountRange ? 0 : null });
-    await persistTags(list);
+    await persistTagsWithBankDecision(
+      list,
+      /*removeUnknowns*/ false,
+      /*keepUnknowns*/ true
+    );
   }
 
   async function setAmount(t: TagDef, n: number) {
     let list = tokenList();
     const ix = list.findIndex((x) => x.tag.id === t.id);
+    const adding = ix < 0;
+
+    if (adding && bankDiffAndHasTags) {
+      setPendingAdd({ tag: t, amount: n });
+      setConfirmSwitchOpen(true);
+      return;
+    }
+
     if (ix >= 0) list[ix] = { tag: t, amount: n };
     else list.push({ tag: t, amount: n });
-    await persistTags(list);
+    await persistTagsWithBankDecision(
+      list,
+      /*removeUnknowns*/ false,
+      /*keepUnknowns*/ true
+    );
   }
 
   function toggleSort() {
@@ -588,6 +634,30 @@ function SongTagging({
     const newIx = sorted.findIndex((s) => s.path === currentPath);
     if (newIx >= 0) setCurrentIndex(newIx);
   }
+  function getBankFromComment(comment: string): string | null {
+    const tok = splitTokens(comment).find((t) => t.startsWith("TagB:"));
+    return tok ? tok.slice("TagB:".length) : null;
+  }
+
+  const unknown: string[] = React.useMemo(
+    () => unknownTokensFromComment(meta?.comment || "", tagsFile.tags),
+    [meta?.comment, tagsFile.tags]
+  );
+
+  const fileBank = React.useMemo(
+    () => getBankFromComment(meta?.comment || ""),
+    [meta?.comment]
+  );
+
+  const tokensExcludingBank = React.useMemo(
+    () =>
+      splitTokens(meta?.comment || "").filter((t) => !t.startsWith("TagB:")),
+    [meta?.comment]
+  );
+
+  const hasAnyFileTags = tokensExcludingBank.length > 0;
+
+  const bankDiffAndHasTags = !!fileBank && fileBank !== bank && hasAnyFileTags;
 
   // ---- Render (single return; no early-return that could skip hooks) ----
   return (
@@ -676,9 +746,8 @@ function SongTagging({
                 onChange={(e) => {
                   const val = e.currentTarget.value;
                   if (val === "__new__") {
-                    // revert selection and open modal
-                    e.currentTarget.value = bank;
-                    onCreateBank();
+                    e.currentTarget.value = bank; // revert visual selection
+                    onCreateBank(); // <-- open modal
                   } else {
                     onSelectBank(val);
                   }
@@ -702,6 +771,16 @@ function SongTagging({
 
         {meta && (
           <div className="row" style={{ alignItems: "flex-start" }}>
+            {bankDiffAndHasTags && (
+              <div
+                className="panel"
+                style={{ borderColor: "#f80", color: "#a50", marginBottom: 8 }}
+              >
+                This file was tagged with a different tag bank:{" "}
+                <b>{fileBank}</b>. You currently selected <b>{bank}</b>.
+              </div>
+            )}
+
             <div className="panel" style={{ flex: 1 }}>
               <Waveform
                 url={mediaUrl}
@@ -778,6 +857,31 @@ function SongTagging({
                 </span>
               )
             )}
+
+            {unknown.length > 0 && (
+              <div className="panel" style={{ marginTop: 8 }}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>
+                  Unknown tags in file
+                  {fileBank ? (
+                    <span style={{ fontWeight: 400 }}>
+                      {" "}
+                      (tagged from this tagbank: <b>{fileBank}</b>)
+                    </span>
+                  ) : null}
+                </div>
+                <div>
+                  {unknown.map((u: string) => (
+                    <span
+                      key={u}
+                      className="chip warning"
+                      title="This tag is not in the current tag bank"
+                    >
+                      {u}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
@@ -836,12 +940,120 @@ function SongTagging({
             tags={tagsFile}
             setTags={async (tf) => {
               setTagsFile(tf);
-              await writeTagsFile(JSON.stringify(tf));
+              await writeTagsFileBank(bank, JSON.stringify(tf));
               await logEvent("write_tags_file");
             }}
             onClose={() => setShowManager(false)}
           />
         )}
+        {confirmSwitchOpen && pendingAdd && (
+          <ConfirmSwitchBankModal
+            currentBank={bank}
+            fileBank={fileBank || "(unknown)"}
+            unknown={unknown}
+            onCancel={() => {
+              setConfirmSwitchOpen(false);
+              setPendingAdd(null);
+            }}
+            onSwitchKeepUnknowns={async () => {
+              setConfirmSwitchOpen(false);
+              if (!pendingAdd) return;
+              const list = [...tokenList()];
+              const has = list.some((x) => x.tag.id === pendingAdd.tag.id);
+              if (!has) list.push(pendingAdd);
+              await persistTagsWithBankDecision(
+                list,
+                /*removeUnknowns*/ false,
+                /*keepUnknowns*/ true
+              );
+              setPendingAdd(null);
+            }}
+            onSwitchRemoveUnknowns={async () => {
+              setConfirmSwitchOpen(false);
+              if (!pendingAdd) return;
+              const list = [...tokenList()];
+              const has = list.some((x) => x.tag.id === pendingAdd.tag.id);
+              if (!has) list.push(pendingAdd);
+              await persistTagsWithBankDecision(
+                list,
+                /*removeUnknowns*/ true,
+                /*keepUnknowns*/ false
+              );
+              setPendingAdd(null);
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ConfirmSwitchBankModal({
+  currentBank,
+  fileBank,
+  unknown,
+  onCancel,
+  onSwitchKeepUnknowns,
+  onSwitchRemoveUnknowns,
+}: {
+  currentBank: string;
+  fileBank: string;
+  unknown: string[];
+  onCancel: () => void;
+  onSwitchKeepUnknowns: () => void;
+  onSwitchRemoveUnknowns: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onCancel();
+      }
+    };
+    const opts = { capture: true } as AddEventListenerOptions;
+    window.addEventListener("keydown", onKey, opts);
+    return () => window.removeEventListener("keydown", onKey, opts);
+  }, [onCancel]);
+
+  return (
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        tabIndex={0}
+        style={{ maxWidth: 560 }}
+      >
+        <h3 style={{ marginTop: 0 }}>Switch tag bank?</h3>
+        <div className="panel" style={{ marginBottom: 12 }}>
+          This file appears to be tagged with <b>{fileBank}</b>. You are using{" "}
+          <b>{currentBank}</b>.
+          <br />
+          Adding a tag will change the file’s tag bank to <b>{currentBank}</b>.
+        </div>
+
+        {unknown.length > 0 && (
+          <div className="panel" style={{ marginBottom: 12 }}>
+            Unknown tags present:{" "}
+            {unknown.map((u) => (
+              <span key={u} className="chip warning" style={{ marginRight: 4 }}>
+                {u}
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="col" style={{ gap: 8 }}>
+          <button className="btn primary" onClick={onSwitchRemoveUnknowns}>
+            Switch & Remove Unknowns
+          </button>
+          <button className="btn" onClick={onSwitchKeepUnknowns}>
+            Switch & Keep Unknowns
+          </button>
+          <button className="btn ghost" onClick={onCancel}>
+            Cancel
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1132,14 +1344,22 @@ export default function App() {
   async function finalizeCreateBank(rawName: string) {
     const name = sanitizeBank(rawName);
     if (!name) return;
-    // already exists? just switch
-    if (banks.includes(name)) {
-      setBank(name);
-      setShowNewBank(false);
+
+    // re-fetch to avoid race conditions (another create could have happened)
+    const current = await listTagBanks().catch(() => []);
+    const exists = current.some((b) => b.toLowerCase() === name.toLowerCase());
+    if (exists) {
+      // leave modal open; let the user change the name
+      pushStatus(
+        <span>
+          Tag bank <b>{name}</b> already exists.
+        </span>
+      );
       return;
     }
-    // create empty file and refresh list
+
     await writeTagsFileBank(name, JSON.stringify(emptyTags()));
+
     const list = await listTagBanks().catch(() => []);
     setBanks(list.length ? list : ["default"]);
     setBank(name);
@@ -1196,6 +1416,7 @@ export default function App() {
         <NewBankModal
           value={pendingBankName}
           setValue={setPendingBankName}
+          existing={banks}
           onCancel={() => setShowNewBank(false)}
           onCreate={() => finalizeCreateBank(pendingBankName)}
         />
@@ -1210,12 +1431,34 @@ function NewBankModal({
   setValue,
   onCancel,
   onCreate,
+  existing,
 }: {
   value: string;
   setValue: (s: string) => void;
   onCancel: () => void;
   onCreate: () => void;
+  existing: string[]; // 👈 new prop
 }) {
+  const [err, setErr] = React.useState<string>("");
+
+  function tryCreate() {
+    const sanitized = sanitizeBank(value);
+    if (!sanitized) {
+      setErr("Please enter a name.");
+      return;
+    }
+    // case-insensitive check (sanitizeBank already lowercases, but keep it robust)
+    const exists = existing.some(
+      (b) => b.toLowerCase() === sanitized.toLowerCase()
+    );
+    if (exists) {
+      setErr(`A tag bank named “${sanitized}” already exists.`);
+      return;
+    }
+    setErr("");
+    onCreate(); // App will do the actual creation
+  }
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -1225,13 +1468,15 @@ function NewBankModal({
       } else if (e.key === "Enter") {
         e.preventDefault();
         e.stopPropagation();
-        onCreate();
+        tryCreate();
       }
     };
     const opts = { capture: true } as AddEventListenerOptions;
     window.addEventListener("keydown", onKey, opts);
     return () => window.removeEventListener("keydown", onKey, opts);
-  }, [onCancel, onCreate]);
+  }, [onCancel]);
+
+  const preview = sanitizeBank(value || "default");
 
   return (
     <div className="modal-backdrop" onClick={onCancel}>
@@ -1248,7 +1493,7 @@ function NewBankModal({
           if (e.key === "Enter") {
             e.preventDefault();
             e.stopPropagation();
-            onCreate();
+            tryCreate();
           }
         }}
         style={{ maxWidth: 520 }}
@@ -1259,25 +1504,34 @@ function NewBankModal({
             Close
           </button>
         </div>
+
+        {err && (
+          <div className="panel" style={{ borderColor: "#f00", color: "#900" }}>
+            {err}
+          </div>
+        )}
+
         <div className="panel">
           <label className="col">
             Name (letters, numbers, - and _)
             <input
               autoFocus
               value={value}
-              onChange={(e) => setValue(e.currentTarget.value)}
+              onChange={(e) => {
+                setValue(e.currentTarget.value);
+                if (err) setErr(""); // clear error while typing
+              }}
               placeholder="e.g., edm-bank-01"
             />
           </label>
           <div style={{ marginTop: 8, color: "#666", fontSize: 13 }}>
-            Will be saved as{" "}
-            <code>tags.{sanitizeBank(value || "default")}.json</code> in
+            Will be saved as <code>tags.{preview}.json</code> in
             <br />
             <code>~/Documents/AudioTagger/Banks</code>
           </div>
         </div>
         <div className="row" style={{ gap: 8 }}>
-          <button className="btn primary" onClick={onCreate}>
+          <button className="btn primary" onClick={tryCreate}>
             Create <span className="kbd">Enter</span>
           </button>
           <button className="btn" onClick={onCancel}>

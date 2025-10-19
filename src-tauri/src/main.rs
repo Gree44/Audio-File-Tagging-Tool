@@ -153,6 +153,30 @@ fn save_prefs(p: &Prefs) -> Result<(), String> {
   std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+
+
+// ---- Bank registry (ever created) ----
+fn banks_registry_path() -> PathBuf {
+  documents_root().join("banks_registry.json")
+}
+
+fn read_banks_registry() -> Vec<String> {
+  let p = banks_registry_path();
+  match std::fs::read_to_string(&p) {
+    Ok(s) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
+    Err(_) => Vec::new(),
+  }
+}
+
+fn write_banks_registry(mut list: Vec<String>) -> Result<(), String> {
+  list.sort();
+  list.dedup();
+  let p = banks_registry_path();
+  let json = serde_json::to_string_pretty(&list).map_err(|e| e.to_string())?;
+  std::fs::write(&p, json).map_err(|e| e.to_string())
+}
+
+
 //////////////////// commands ////////////////////
 
 #[tauri::command]
@@ -417,8 +441,17 @@ fn read_tags_file_bank(bank: String) -> Result<String, String> {
 #[tauri::command]
 fn write_tags_file_bank(bank: String, json: String) -> Result<(), String> {
   let path = bank_path(&bank);
-  fs::write(&path, json).map_err(|e| e.to_string())
+  std::fs::write(&path, json).map_err(|e| e.to_string())?;
+  // also add to registry if new
+  let mut all = read_banks_registry();
+  let s = sanitize_bank(&bank);
+  if !all.iter().any(|b| b.eq_ignore_ascii_case(&s)) {
+    all.push(s);
+    write_banks_registry(all)?;
+  }
+  Ok(())
 }
+
 
 #[tauri::command]
 fn get_last_used_bank() -> Result<Option<String>, String> {
@@ -605,6 +638,18 @@ fn media_url_for_path(path: String, state: tauri::State<AppState>) -> String {
   format!("{}/audio?path={}", state.media_base, enc)
 }
 
+#[tauri::command]
+fn get_known_banks() -> Result<Vec<String>, String> {
+  Ok(read_banks_registry())
+}
+
+#[tauri::command]
+fn check_bank_available(name: String) -> Result<bool, String> {
+  let s = sanitize_bank(&name);
+  let all = read_banks_registry();
+  Ok(!all.iter().any(|b| b.eq_ignore_ascii_case(&s)))
+}
+
 
 
 pub fn main() {
@@ -614,7 +659,9 @@ pub fn main() {
    write_settings,
    get_last_used_bank,
    set_last_used_bank,
-  get_last_used_bank, set_last_used_bank
+  get_last_used_bank, set_last_used_bank,
+  get_known_banks, check_bank_available,
+
     ])
     .setup(|app| {
     tauri::async_runtime::block_on(async {

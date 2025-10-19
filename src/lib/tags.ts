@@ -120,3 +120,39 @@ export function ensureAtLeastOneMain(
     all.filter((t) => t.type === "main").length === 0
   );
 }
+
+// Add `export` in front of each helper
+
+export function splitTokens(comment: string): string[] {
+  return comment
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function isRecognizedToken(token: string, defs: TagDef[]): boolean {
+  if (token.startsWith("TagB:")) return true; // this one is special/known
+  for (const t of defs) {
+    if (!t.amountRange) {
+      if (token === t.name) return true;
+    } else {
+      if (token.startsWith(t.name)) {
+        const n = token.slice(t.name.length);
+        if (/^\d+$/.test(n)) {
+          const v = parseInt(n, 10);
+          const { min, max } = t.amountRange;
+          if (v >= min && v <= max) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+export function unknownTokensFromComment(
+  comment: string,
+  defs: TagDef[]
+): string[] {
+  const toks = splitTokens(comment).filter(Boolean);
+  return toks.filter((t) => !isRecognizedToken(t, defs));
+}

@@ -162,3 +162,11 @@ export async function readSettings(): Promise<Settings> {
 export async function writeSettings(s: Settings): Promise<void> {
   await invoke<void>("write_settings", { settings: s });
 }
+
+export async function getKnownBanks(): Promise<string[]> {
+  return invoke<string[]>("get_known_banks");
+}
+
+export async function checkBankAvailable(name: string): Promise<boolean> {
+  return invoke<boolean>("check_bank_available", { name });
+}
