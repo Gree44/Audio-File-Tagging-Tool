@@ -410,6 +410,7 @@ function SongTagging({
     tag: TagDef;
     amount: number | null;
   } | null>(null);
+  const [clearConfirmOpen, setClearConfirmOpen] = useState(false);
 
   // ---- Hoisted helpers (function declarations avoid TDZ) ----
   async function loadTrackForEntry(entry: { path: string; fileName: string }) {
@@ -462,6 +463,18 @@ function SongTagging({
     await loadTrackForEntry(files[bounded]);
     if (settings.instantPlayback && !isInitialLoadRef.current) {
       setPlaying(true);
+    }
+  }
+
+  async function doClearTags() {
+    if (!meta) return;
+    try {
+      await writeComment(meta.path, "");
+      await logEvent(`clear_tags path="${meta.path}"`);
+      setMeta({ ...meta, comment: "" });
+      pushStatus(<span>All tags cleared.</span>);
+    } catch (e) {
+      alert("Failed to clear tags: " + e);
     }
   }
 
@@ -530,6 +543,27 @@ function SongTagging({
 
   function tokenList() {
     return parseCommentToTags(meta?.comment || "", tagsFile.tags);
+  }
+
+  async function clearTagsConfirm() {
+    if (!meta) return;
+    if (!meta.comment) {
+      pushStatus(<span>No tags to clear.</span>);
+      return;
+    }
+    const ok = window.confirm(
+      "Clear ALL tags for this file? This will erase the entire comment field."
+    );
+    if (!ok) return;
+
+    try {
+      await writeComment(meta.path, ""); // wipe comment completely
+      await logEvent(`clear_tags path="${meta.path}"`);
+      setMeta({ ...meta, comment: "" }); // update UI
+      pushStatus(<span>All tags cleared.</span>);
+    } catch (e) {
+      alert("Failed to clear tags: " + e);
+    }
   }
 
   async function persistTagsWithBankDecision(
@@ -840,9 +874,25 @@ function SongTagging({
         )}
 
         <div className="panel">
-          <div style={{ fontWeight: 600, marginBottom: 6 }}>
-            Selected tags for this song
+          <div
+            className="row"
+            style={{
+              justifyContent: "space-between",
+              alignItems: "center",
+              marginBottom: 6,
+            }}
+          >
+            <div style={{ fontWeight: 600 }}>Selected tags for this song</div>
+            <button
+              className="btn"
+              onClick={() => setClearConfirmOpen(true)}
+              disabled={!meta || !(meta.comment && meta.comment.trim().length)}
+              title="Erase the entire comment field (removes all tags, including TagB)."
+            >
+              Clear Tags
+            </button>
           </div>
+
           <div>
             {parseCommentToTags(meta?.comment || "", tagsFile.tags).map(
               ({ tag, amount }) => (
@@ -983,6 +1033,77 @@ function SongTagging({
             }}
           />
         )}
+        {clearConfirmOpen && (
+          <ClearTagsModal
+            onCancel={() => setClearConfirmOpen(false)}
+            onConfirm={async () => {
+              setClearConfirmOpen(false);
+              await doClearTags();
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ClearTagsModal({
+  onCancel,
+  onConfirm,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onCancel();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        onConfirm();
+      }
+    };
+    const opts = { capture: true } as AddEventListenerOptions;
+    window.addEventListener("keydown", onKey, opts);
+    return () => window.removeEventListener("keydown", onKey, opts);
+  }, [onCancel, onConfirm]);
+
+  return (
+    <div className="modal-backdrop" onClick={onCancel}>
+      <div
+        className="modal"
+        onClick={(e) => e.stopPropagation()}
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            e.stopPropagation();
+            onCancel();
+          }
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.stopPropagation();
+            onConfirm();
+          }
+        }}
+        style={{ maxWidth: 520 }}
+      >
+        <h3 style={{ marginTop: 0 }}>Clear all tags?</h3>
+        <div className="panel" style={{ marginBottom: 12 }}>
+          This will erase the entire comment field for this file, removing all
+          tags (including the <code>TagB:&lt;bank&gt;</code> token).
+        </div>
+        <div className="row" style={{ gap: 8 }}>
+          <button className="btn primary" onClick={onConfirm}>
+            Yes, clear <span className="kbd">Enter</span>
+          </button>
+          <button className="btn" onClick={onCancel}>
+            Cancel <span className="kbd">Esc</span>
+          </button>
+        </div>
       </div>
     </div>
   );
