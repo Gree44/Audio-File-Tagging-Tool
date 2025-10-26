@@ -867,6 +867,29 @@ function SongTagging({
                       <b>Genre:</b> {meta.genre || "—"}
                     </div>
                   )}
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                      Comment
+                    </div>
+                    <textarea
+                      readOnly
+                      value={meta.comment || ""}
+                      style={{
+                        width: "100%",
+                        minHeight: 72,
+                        resize: "vertical",
+                        fontFamily:
+                          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                        fontSize: 12,
+                        lineHeight: 1.35,
+                        padding: 8,
+                        borderRadius: 6,
+                        border: "1px solid #ddd",
+                        background: "#fafafa",
+                        color: "#333",
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
             </div>

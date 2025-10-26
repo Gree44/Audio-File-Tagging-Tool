@@ -1,6 +1,9 @@
 # Audio Tagger (Tauri + React + Rust)
 
+OUTDATED!!
+
 **Features implemented**
+
 - Open a folder, list supported audio files (MP3, FLAC, WAV, AIFF, M4A)
 - Waveform preview with play/pause, time display (elapsed left / total right)
 - Current position red line with darker played region
@@ -16,6 +19,7 @@
 - Writes serialized so file ops can't interleave
 
 ## Quick start (macOS)
+
 ```bash
 # 1) Xcode command line tools (if not installed)
 xcode-select --install
@@ -37,12 +41,14 @@ npm run tauri:dev
 The Tauri dev process will build the Rust side and launch a window on top of `vite`.
 
 ## Notes
+
 - For M4A/MP4, comments are written to the canonical atom via `lofty`'s `ItemKey::Comment`.
 - If your files are read-only, writing will fail; the app shows a popup and logs the error.
 - Amount tags are emitted as `<name><integer>` (e.g., `energy3`). Default is `0` until you set it.
 - To change which metadata fields show, click ⚙️ (top-right).
 
 ## Roadmap
+
 - Batch tagging across folder
 - Precompute waveform peaks and cache
 - Region markers + apply tags from region
