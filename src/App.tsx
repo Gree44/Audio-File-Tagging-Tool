@@ -867,29 +867,31 @@ function SongTagging({
                       <b>Genre:</b> {meta.genre || "—"}
                     </div>
                   )}
-                  <div style={{ marginTop: 10 }}>
-                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                      Comment
+                  {settings.showComment && (
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                        Comment
+                      </div>
+                      <textarea
+                        readOnly
+                        value={meta.comment || ""}
+                        style={{
+                          width: "100%",
+                          minHeight: 72,
+                          resize: "vertical",
+                          fontFamily:
+                            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                          fontSize: 12,
+                          lineHeight: 1.35,
+                          padding: 8,
+                          borderRadius: 6,
+                          border: "1px solid #ddd",
+                          background: "#fafafa",
+                          color: "#333",
+                        }}
+                      />
                     </div>
-                    <textarea
-                      readOnly
-                      value={meta.comment || ""}
-                      style={{
-                        width: "100%",
-                        minHeight: 72,
-                        resize: "vertical",
-                        fontFamily:
-                          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-                        fontSize: 12,
-                        lineHeight: 1.35,
-                        padding: 8,
-                        borderRadius: 6,
-                        border: "1px solid #ddd",
-                        background: "#fafafa",
-                        color: "#333",
-                      }}
-                    />
-                  </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1304,6 +1306,17 @@ function GlobalSettingsModal({
               />{" "}
               Show genre
             </label>
+            <br />
+            <label>
+              <input
+                type="checkbox"
+                checked={settings.showComment ?? true}
+                onChange={(e) =>
+                  setSettings({ ...settings, showComment: e.target.checked })
+                }
+              />{" "}
+              Show comments
+            </label>
           </div>
 
           <div className="panel">
@@ -1389,12 +1402,15 @@ export default function App() {
   const [tagsFile, setTagsFile] = useState<TagsFile>(emptyTags());
   const [showManager, setShowManager] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [settings, setSettings] = useState<Settings>({
+  const defaultSettings: Settings = {
     showTitle: true,
     showAuthors: true,
     showGenre: true,
+    showComment: true, // <— NEW default
     instantPlayback: false,
-  });
+  };
+  const [settings, setSettings] = useState<Settings>(defaultSettings);
+
   const [banks, setBanks] = useState<string[]>(["default"]);
   const [bank, setBank] = useState<string>("default");
   const [showNewBank, setShowNewBank] = useState(false);
@@ -1406,7 +1422,7 @@ export default function App() {
       // 1) Load settings first (fallback to defaults if error)
       try {
         const s = await readSettings();
-        setSettings(s);
+        setSettings({ ...defaultSettings, ...s });
       } catch {
         /* use defaults */
       }

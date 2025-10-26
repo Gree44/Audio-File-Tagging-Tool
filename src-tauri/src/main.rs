@@ -104,10 +104,12 @@ fn prefs_path() -> PathBuf {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)] 
 struct Settings {
   show_title: bool,
   show_authors: bool,
   show_genre: bool,
+  show_comment: bool,
   instant_playback: bool,
 }
 
@@ -117,6 +119,7 @@ impl Default for Settings {
       show_title: true,
       show_authors: true,
       show_genre: true,
+      show_comment: true,
       instant_playback: false,
     }
   }

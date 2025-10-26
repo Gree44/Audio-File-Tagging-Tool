@@ -155,6 +155,7 @@ export async function readSettings(): Promise<Settings> {
     showTitle: !!s.showTitle,
     showAuthors: !!s.showAuthors,
     showGenre: !!s.showGenre,
+    showComment: !!s.showComment,
     instantPlayback: !!s.instantPlayback,
   };
 }

@@ -27,5 +27,6 @@ export interface Settings {
   showAuthors: boolean;
   showGenre: boolean;
   showAlbum?: boolean;
+  showComment?: boolean;
   instantPlayback: boolean;
 }
